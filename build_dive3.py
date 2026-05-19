@@ -103,22 +103,58 @@ cache/dive3_tokens.npz  # cached disassembly (survives reruns)
 """)
 
 # ---------------------------------------------------------------------------
-md("""## 1 — TPU setup
+md("""## 1 — TPU runtime bootstrap (before `import tensorflow`)
 
-**Important:** TPU init must run at the very start, before any tf.function
-compilation or variable creation. Mixed-bfloat16 policy is set immediately
-after so every layer created later uses bf16 compute.
+Per Google's Cloud TPU docs, **TPU v5e (and newer) only support the PJRT
+runtime**, and Kaggle's stock TF 2.20 wheel doesn't auto-discover `libtpu.so`
+even though it's bundled with the JAX install on Kaggle's TPU VM image. So
+before importing TF we:
 
-On Kaggle the canonical resolver string is `'local'` (the TPU runs in the
-same VM as the notebook). The no-arg auto-detect that works on older Cloud
-TPU Nodes errors out on Kaggle TPU VM with
-`ValueError: Please provide a TPU Name to connect to.` — we try `'local'`
-first and fall back to `''` and then to the default strategy.
+1. Set `NEXT_PLUGGABLE_DEVICE_USE_C_API=true` — switch TF to the PJRT
+   pluggable-device path (required on v5e/v5p).
+2. Set `TF_PLUGGABLE_DEVICE_LIBRARY_PATH=<path-to-libtpu.so>` — point TF at
+   the libtpu shipped with JAX/PyTorch-XLA on the Kaggle image.
+
+After that, the resolver loop tries `tpu='local'` (TPU VM), then `tpu=''`
+(legacy TPU Node), then falls back to the default strategy. The mixed-bfloat16
+policy is then set before any model/variable creation.
 """)
 
-code("""import os, sys, gc, json, math, time, random, warnings, traceback, pickle
+code("""# ── Step 1: TPU runtime bootstrap (must run *before* import tensorflow) ────
+import os, sys, glob, site, gc, json, math, time, random, warnings, traceback, pickle
 from pathlib import Path
 from datetime import datetime
+
+# Force PJRT pluggable-device API. Required for TPU v5e/v5p; harmless on v3/v4.
+os.environ.setdefault('NEXT_PLUGGABLE_DEVICE_USE_C_API', 'true')
+
+def _find_libtpu():
+    \"\"\"Locate libtpu.so on the Kaggle TPU VM image. JAX and torch_xla both
+    bundle it under their site-packages.\"\"\"
+    candidates = []
+    search_dirs = list(site.getsitepackages()) + [site.getusersitepackages()]
+    # Also probe the standard install locations Kaggle uses
+    search_dirs += glob.glob("/usr/local/lib/python*/site-packages")
+    search_dirs += glob.glob("/usr/lib/python*/site-packages")
+    seen = set()
+    for d in search_dirs:
+        if d in seen: continue
+        seen.add(d)
+        # libtpu package (installed by JAX or as a standalone wheel)
+        candidates += glob.glob(os.path.join(d, "libtpu", "libtpu.so"))
+        # PyTorch/XLA bundle
+        candidates += glob.glob(os.path.join(d, "torch_xla", "lib", "libtpu.so"))
+    return candidates[0] if candidates else None
+
+_libtpu = _find_libtpu()
+if _libtpu:
+    os.environ.setdefault('TF_PLUGGABLE_DEVICE_LIBRARY_PATH', _libtpu)
+    # TPU_LIBRARY_PATH is the older variable name some TF builds still look for
+    os.environ.setdefault('TPU_LIBRARY_PATH', _libtpu)
+    print(f"libtpu.so → {_libtpu}", flush=True)
+else:
+    print("libtpu.so not found in site-packages — TPU init will likely fail. "
+          "If you're not on a TPU VM, this is expected.", flush=True)
 
 import numpy as np
 import pandas as pd
@@ -127,19 +163,14 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers
 
 warnings.filterwarnings("ignore")
-
 print(f"TensorFlow {tf.__version__}", flush=True)
 
-# ── Resolve and initialise the TPU ──────────────────────────────────────────
-# Try TPU-VM-style ('local') first — required on Kaggle's TPU VM v3/v4/v5e
-# and on Cloud TPU VM. Fall back to no-arg auto-detect for older TPU Node
-# setups (e.g. legacy Colab). Finally, fall back to the default (CPU/GPU)
-# strategy so the notebook still runs locally for smoke tests.
+
+# ── Step 2: Resolve and initialise the TPU ────────────────────────────────
 def _try_tpu_init(tpu_arg):
     resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=tpu_arg)
-    # On TPU VM (tpu='local') the runtime is already in-process, so
-    # experimental_connect_to_cluster is unnecessary; we still try it but
-    # swallow the error if it doesn't apply.
+    # On TPU VM (tpu='local') the runtime is already in-process; the
+    # connect_to_cluster call is unnecessary and can fail. Swallow if so.
     try:
         tf.config.experimental_connect_to_cluster(resolver)
     except Exception as _ce:
@@ -167,7 +198,8 @@ if ON_TPU:
     print("TPU devices:", tf.config.list_logical_devices('TPU'), flush=True)
 print(f"Num replicas in sync: {strategy.num_replicas_in_sync}", flush=True)
 
-# ── Mixed bfloat16 ──────────────────────────────────────────────────────────
+
+# ── Step 3: Mixed bfloat16 ────────────────────────────────────────────────
 # Must be set *before* any model/variable creation. Compute is bf16, variables
 # stay fp32. The final classification layer is forced to fp32 for stability.
 tf.keras.mixed_precision.set_global_policy('mixed_bfloat16' if ON_TPU else 'float32')
