@@ -52,8 +52,9 @@ def code(text: str):
 md("""# DIVE-3 (TPU) — TensorFlow + TPUStrategy port
 
 This is the **TensorFlow / Keras** version of `dive-3`, targeting **Kaggle TPU
-v3-8** (8 cores × 16 GB HBM). The PyTorch GPU version lives at commit
-`441e958` on `main` (merged via PR #1) and remains valid for T4 ×2 runs.
+v3-8 or v5e-8** (8 cores × 16 GB HBM per chip in both cases). The PyTorch GPU
+version lives at commit `441e958` on `main` (merged via PR #1) and remains
+valid for T4 ×2 runs.
 
 Architecturally **identical** to PyTorch dive-3 — same model, same loss, same
 augmentation, same checkpoint semantics — only the framework and the device
@@ -63,7 +64,7 @@ distribution change.
 
 | Concern | Choice |
 |---|---|
-| Init | `TPUClusterResolver()` (auto-detect on Kaggle) → `experimental_connect_to_cluster` → `initialize_tpu_system` → `TPUStrategy` |
+| Init | `TPUClusterResolver(tpu='local')` (Kaggle TPU VM v3/v4/v5e) → `initialize_tpu_system` → `TPUStrategy`. Falls back to `tpu=''` for older TPU Node setups, then default strategy if no TPU. |
 | Precision | `tf.keras.mixed_precision.set_global_policy('mixed_bfloat16')`. Compute in bf16; variables stay fp32. **No loss scaling** — TPU bf16 has fp32 dynamic range. Final `Dense` is fp32 for output stability. |
 | Distribution | `strategy.scope()` wraps model + optimizer + EMA + checkpoint creation. `strategy.experimental_distribute_dataset` splits global batch across the 8 cores. |
 | Static shapes | `drop_remainder=True` on every `.batch()`. All tensor dims fixed at graph build. `MAX_OPS = 1024` baked into the model. |
@@ -107,6 +108,12 @@ md("""## 1 — TPU setup
 **Important:** TPU init must run at the very start, before any tf.function
 compilation or variable creation. Mixed-bfloat16 policy is set immediately
 after so every layer created later uses bf16 compute.
+
+On Kaggle the canonical resolver string is `'local'` (the TPU runs in the
+same VM as the notebook). The no-arg auto-detect that works on older Cloud
+TPU Nodes errors out on Kaggle TPU VM with
+`ValueError: Please provide a TPU Name to connect to.` — we try `'local'`
+first and fall back to `''` and then to the default strategy.
 """)
 
 code("""import os, sys, gc, json, math, time, random, warnings, traceback, pickle
@@ -124,20 +131,41 @@ warnings.filterwarnings("ignore")
 print(f"TensorFlow {tf.__version__}", flush=True)
 
 # ── Resolve and initialise the TPU ──────────────────────────────────────────
-try:
-    # On Kaggle, no-arg auto-detects via TPU_NAME / KAGGLE_TPU_NAME env vars.
-    resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
-    tf.config.experimental_connect_to_cluster(resolver)
+# Try TPU-VM-style ('local') first — required on Kaggle's TPU VM v3/v4/v5e
+# and on Cloud TPU VM. Fall back to no-arg auto-detect for older TPU Node
+# setups (e.g. legacy Colab). Finally, fall back to the default (CPU/GPU)
+# strategy so the notebook still runs locally for smoke tests.
+def _try_tpu_init(tpu_arg):
+    resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu=tpu_arg)
+    # On TPU VM (tpu='local') the runtime is already in-process, so
+    # experimental_connect_to_cluster is unnecessary; we still try it but
+    # swallow the error if it doesn't apply.
+    try:
+        tf.config.experimental_connect_to_cluster(resolver)
+    except Exception as _ce:
+        print(f"[info] connect_to_cluster skipped: {_ce!r}", flush=True)
     tf.tpu.experimental.initialize_tpu_system(resolver)
-    strategy = tf.distribute.TPUStrategy(resolver)
-    print("TPU devices:", tf.config.list_logical_devices('TPU'), flush=True)
-    print(f"Num replicas in sync: {strategy.num_replicas_in_sync}", flush=True)
-    ON_TPU = True
-except (ValueError, KeyError, tf.errors.NotFoundError) as e:
-    print(f"TPU not available ({e!r}) — falling back to default strategy.", flush=True)
+    return tf.distribute.TPUStrategy(resolver)
+
+
+strategy = None
+ON_TPU   = False
+for _arg in ('local', ''):
+    try:
+        strategy = _try_tpu_init(_arg)
+        ON_TPU = True
+        print(f"TPU initialised via tpu={_arg!r}", flush=True)
+        break
+    except (ValueError, KeyError, tf.errors.NotFoundError, RuntimeError) as e:
+        print(f"TPU init with tpu={_arg!r} failed: {e!r}", flush=True)
+
+if not ON_TPU:
+    print("No TPU available — falling back to default strategy (CPU/GPU).", flush=True)
     strategy = tf.distribute.get_strategy()
-    ON_TPU = False
-    print(f"Num replicas: {strategy.num_replicas_in_sync}", flush=True)
+
+if ON_TPU:
+    print("TPU devices:", tf.config.list_logical_devices('TPU'), flush=True)
+print(f"Num replicas in sync: {strategy.num_replicas_in_sync}", flush=True)
 
 # ── Mixed bfloat16 ──────────────────────────────────────────────────────────
 # Must be set *before* any model/variable creation. Compute is bf16, variables
