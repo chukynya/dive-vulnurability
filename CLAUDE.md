@@ -24,3 +24,15 @@ All data sits under `Dataset/`:
 ## Commands
 
 There are no build, lint, or test commands — this repo ships data only. If you need to regenerate `Bytecode_filled.csv` or rebuild labels, the relevant notebooks (`fill_bytecode.ipynb`, label-construction notebooks) are in `../sc-vulnerability-detector/`.
+
+## Coding principles (Karpathy-inspired)
+
+Source: https://github.com/multica-ai/andrej-karpathy-skills
+
+**Think before coding** — State assumptions explicitly rather than guessing. Present multiple interpretations when ambiguity exists. Push back when a simpler approach is available. Request clarification when confused.
+
+**Simplicity first** — Write the minimum code that solves the stated problem. Avoid speculative features or unused abstractions. No error handling for impossible scenarios.
+
+**Surgical changes** — Modify only what the request requires. Match existing code style without unsolicited "improvements". Remove only imports/variables made unused by your own changes; mention unrelated dead code rather than deleting it.
+
+**Goal-driven execution** — Transform tasks into verifiable success criteria. State a brief multi-step plan with verification checkpoints before acting. Use tests to define and confirm success.
