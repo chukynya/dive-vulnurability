@@ -1031,7 +1031,10 @@ def save_checkpoint(path, *, model, ema, optimizer, scheduler, scaler,
 
 
 def load_checkpoint(path, *, model, ema, optimizer, scheduler, scaler):
-    ckpt = torch.load(path, map_location=device)
+    # weights_only=False because the checkpoint contains numpy arrays + RNG state
+    # + isotonic calibrators (sklearn objects). All are produced by this notebook
+    # itself, so we trust the source. PyTorch 2.6 flipped the default to True.
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     src = model.module if isinstance(model, nn.DataParallel) else model
     src.load_state_dict(ckpt["model"])
     ema.load_state_dict(ckpt["ema"])
@@ -1279,7 +1282,9 @@ if not BEST_PATH.exists():
     frozen_thresholds = best_thresholds
     frozen_calibrators = best_calibrators
 else:
-    ckpt_b = torch.load(BEST_PATH, map_location=device)
+    # weights_only=False because the checkpoint contains numpy arrays and the
+    # isotonic calibrator list (sklearn objects). PyTorch 2.6 flipped the default to True.
+    ckpt_b = torch.load(BEST_PATH, map_location=device, weights_only=False)
     eval_model = HierarchicalOpcodeModel().to(device)
     eval_model.load_state_dict(ckpt_b["model"])
     frozen_thresholds = np.asarray(ckpt_b["thresholds"], dtype=np.float32)
@@ -1290,10 +1295,131 @@ else:
 if n_gpus > 1 and not isinstance(eval_model, nn.DataParallel):
     eval_model = nn.DataParallel(eval_model)
 
-test_logits, test_labels_arr = predict(eval_model, test_loader)
-test_probs_raw = 1 / (1 + np.exp(-test_logits))
-test_probs     = apply_calibration(test_probs_raw, frozen_calibrators)
+# ── Inference timing: batched (deployed pipeline) ──────────────────────────
+log("=== INFERENCE TIMING (batched) ===")
 
+@torch.no_grad()
+def timed_predict(model, loader, warmup_batches: int = 3):
+    model.eval()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    # Warmup with the first batch — CUDA kernels are slow to compile on first call.
+    first = next(iter(loader))
+    X0  = first[0].to(device, non_blocking=True)
+    TM0 = first[1].to(device, non_blocking=True)
+    CM0 = first[2].to(device, non_blocking=True)
+    for _ in range(warmup_batches):
+        with autocast():
+            _ = model(X0, TM0, CM0)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    # Timed pass.
+    logits_all, labels_all, batch_lats = [], [], []
+    wall_t0 = time.perf_counter()
+    for X, TM, CM, Yb in loader:
+        X  = X.to(device,  non_blocking=True)
+        TM = TM.to(device, non_blocking=True)
+        CM = CM.to(device, non_blocking=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with autocast():
+            logits = model(X, TM, CM)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        batch_lats.append((time.perf_counter() - t0, X.shape[0]))
+        logits_all.append(logits.float().cpu().numpy())
+        labels_all.append(Yb.numpy())
+    wall = time.perf_counter() - wall_t0
+    peak_mem_gb = (torch.cuda.max_memory_allocated()/1e9) if torch.cuda.is_available() else 0.0
+    return np.concatenate(logits_all), np.concatenate(labels_all), batch_lats, wall, peak_mem_gb
+
+
+test_logits, test_labels_arr, batch_lats, batched_wall, batched_mem = \\
+    timed_predict(eval_model, test_loader, warmup_batches=3)
+
+batch_secs       = np.array([s for s, _ in batch_lats], dtype=np.float64)
+batch_sizes_arr  = np.array([n for _, n in batch_lats], dtype=np.int64)
+per_sample_batch = batch_secs / np.maximum(batch_sizes_arr, 1)
+n_samples = int(len(test_labels_arr))
+n_batches = int(len(batch_lats))
+
+log(f"Batched inference  (DataParallel={n_gpus>1}, AMP, batch={BATCH_SIZE}):")
+log(f"  total wall: {batched_wall:.2f}s for {n_samples} samples ({n_batches} batches, post-warmup)")
+log(f"  throughput: {n_samples/batched_wall:>7.1f} samples/sec | "
+    f"{n_samples*N_CHUNKS/batched_wall:>7.1f} chunks/sec")
+log(f"  per-batch latency:        mean={batch_secs.mean()*1000:>7.1f}ms  "
+    f"p50={np.percentile(batch_secs,50)*1000:>7.1f}ms  "
+    f"p90={np.percentile(batch_secs,90)*1000:>7.1f}ms  "
+    f"p99={np.percentile(batch_secs,99)*1000:>7.1f}ms")
+log(f"  per-sample-in-batch:      mean={per_sample_batch.mean()*1000:>7.2f}ms  "
+    f"p50={np.percentile(per_sample_batch,50)*1000:>7.2f}ms")
+log(f"  GPU memory peak: {batched_mem:.2f} GB")
+
+# ── Inference timing: single-sample latency (batch=1, production-style) ────
+log("=== INFERENCE TIMING (single sample, batch=1) ===")
+# Unwrap DataParallel — DP scatter/gather overhead dominates at batch=1.
+single_model = eval_model.module if isinstance(eval_model, nn.DataParallel) else eval_model
+single_model = single_model.to(device).eval()
+
+N_SINGLE = min(200, len(ds_te))
+# Warmup
+for i in range(3):
+    X_i, TM_i, CM_i, _ = ds_te[i]
+    X_i  = X_i.unsqueeze(0).to(device, non_blocking=True)
+    TM_i = TM_i.unsqueeze(0).to(device, non_blocking=True)
+    CM_i = CM_i.unsqueeze(0).to(device, non_blocking=True)
+    with torch.no_grad(), autocast():
+        _ = single_model(X_i, TM_i, CM_i)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+# Timed
+single_lats = []
+for i in range(N_SINGLE):
+    X_i, TM_i, CM_i, _ = ds_te[i]
+    X_i  = X_i.unsqueeze(0).to(device, non_blocking=True)
+    TM_i = TM_i.unsqueeze(0).to(device, non_blocking=True)
+    CM_i = CM_i.unsqueeze(0).to(device, non_blocking=True)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad(), autocast():
+        _ = single_model(X_i, TM_i, CM_i)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    single_lats.append(time.perf_counter() - t0)
+single_lats = np.array(single_lats, dtype=np.float64)
+
+log(f"Single-sample latency (N={N_SINGLE}, single GPU, AMP, batch=1):")
+log(f"  mean={single_lats.mean()*1000:>7.2f}ms  "
+    f"p50={np.percentile(single_lats,50)*1000:>7.2f}ms  "
+    f"p90={np.percentile(single_lats,90)*1000:>7.2f}ms  "
+    f"p99={np.percentile(single_lats,99)*1000:>7.2f}ms")
+
+# ── Probabilities + calibration + threshold (post-processing) ──────────────
+log("=== POST-PROCESSING ===")
+post_t0 = time.perf_counter()
+test_probs_raw = 1 / (1 + np.exp(-test_logits))
+post_sigmoid_dt = time.perf_counter() - post_t0
+
+cal_t0 = time.perf_counter()
+test_probs = apply_calibration(test_probs_raw, frozen_calibrators)
+post_calib_dt = time.perf_counter() - cal_t0
+
+thr_t0 = time.perf_counter()
+y_pred_final = (test_probs >= frozen_thresholds[None, :]).astype(np.int32)
+post_thr_dt = time.perf_counter() - thr_t0
+post_total_dt = post_sigmoid_dt + post_calib_dt + post_thr_dt
+
+log(f"Post-proc on {n_samples} samples: "
+    f"sigmoid={post_sigmoid_dt*1000:.1f}ms  "
+    f"isotonic={post_calib_dt*1000:.1f}ms  "
+    f"threshold={post_thr_dt*1000:.1f}ms  "
+    f"total={post_total_dt*1000:.1f}ms  "
+    f"(per-sample {post_total_dt/n_samples*1000:.3f}ms)")
+
+# ── Metrics ─────────────────────────────────────────────────────────────────
 test_metrics_tuned, per_class_tuned = multilabel_metrics(test_labels_arr, test_probs, frozen_thresholds)
 test_metrics_calib_05, _            = multilabel_metrics(test_labels_arr, test_probs, 0.5)
 test_metrics_raw_05, _              = multilabel_metrics(test_labels_arr, test_probs_raw, 0.5)
@@ -1312,6 +1438,46 @@ pc_df = pd.DataFrame(per_class_tuned).T.round(4)
 log("=== PER-CLASS (calibrated + tuned thresholds) ===")
 for line in pc_df.to_string().splitlines():
     log("  " + line)
+
+# Collected timing summary for metrics.json and inference_timing.json
+timing_summary = {
+    "batched": {
+        "data_parallel": bool(n_gpus > 1),
+        "batch_size": int(BATCH_SIZE),
+        "n_samples": n_samples,
+        "n_batches": n_batches,
+        "total_wall_s": float(batched_wall),
+        "throughput_samples_per_s": float(n_samples / batched_wall),
+        "throughput_chunks_per_s":  float(n_samples * N_CHUNKS / batched_wall),
+        "per_batch_ms": {
+            "mean": float(batch_secs.mean() * 1000),
+            "p50":  float(np.percentile(batch_secs, 50) * 1000),
+            "p90":  float(np.percentile(batch_secs, 90) * 1000),
+            "p99":  float(np.percentile(batch_secs, 99) * 1000),
+        },
+        "per_sample_in_batch_ms": {
+            "mean": float(per_sample_batch.mean() * 1000),
+            "p50":  float(np.percentile(per_sample_batch, 50) * 1000),
+        },
+        "gpu_mem_peak_gb": float(batched_mem),
+    },
+    "single_sample": {
+        "n_samples": int(N_SINGLE),
+        "ms": {
+            "mean": float(single_lats.mean() * 1000),
+            "p50":  float(np.percentile(single_lats, 50) * 1000),
+            "p90":  float(np.percentile(single_lats, 90) * 1000),
+            "p99":  float(np.percentile(single_lats, 99) * 1000),
+        },
+    },
+    "post_processing_ms": {
+        "sigmoid_total":   float(post_sigmoid_dt * 1000),
+        "isotonic_total":  float(post_calib_dt   * 1000),
+        "threshold_total": float(post_thr_dt     * 1000),
+        "total":           float(post_total_dt   * 1000),
+        "per_sample":      float(post_total_dt / n_samples * 1000),
+    },
+}
 """)
 
 code("""# ── Artefact dump ───────────────────────────────────────────────────────────
@@ -1329,6 +1495,7 @@ with open(OUT_DIR / "metrics.json", "w") as f:
         "per_class":              per_class_tuned,
         "best_val_f1_macro":      best_macro_f1,
         "thresholds":             frozen_thresholds.tolist(),
+        "timing":                 timing_summary,
         "hparams": {
             "chunk_size": CHUNK_SIZE, "n_chunks": N_CHUNKS, "max_total_ops": MAX_TOTAL_OPS,
             "vocab_size": VOCAB_SIZE,
@@ -1349,12 +1516,15 @@ with open(OUT_DIR / "metrics.json", "w") as f:
         }}, f, indent=2)
 
 cms = {}
-y_pred_final = (test_probs >= frozen_thresholds[None, :]).astype(np.int32)
 for i, lab in enumerate(LABEL_COLS):
     cm = confusion_matrix(test_labels_arr[:, i], y_pred_final[:, i], labels=[0, 1])
     cms[lab] = cm.tolist()
 with open(OUT_DIR / "confusion_per_class.json", "w") as f:
     json.dump(cms, f, indent=2)
+
+# Standalone timing file (also embedded inside metrics.json above)
+with open(OUT_DIR / "inference_timing.json", "w") as f:
+    json.dump(timing_summary, f, indent=2)
 
 log("Artefacts written:")
 for p in sorted(OUT_DIR.iterdir()):
