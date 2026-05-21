@@ -297,7 +297,10 @@ Wrapped in `DataParallel` for the stage-1 encode so both T4s are used.
 
 code("""t0 = time.time()
 gcb_tokenizer = AutoTokenizer.from_pretrained(GCB_MODEL)
-gcb = AutoModel.from_pretrained(GCB_MODEL).to(device).eval()
+# add_pooling_layer=False: we mean-pool last_hidden_state ourselves, so the
+# RobertaModel CLS pooler is unused. Skipping it avoids a randomly-initialised
+# unused head (the "pooler.dense MISSING" load warning) and a few extra params.
+gcb = AutoModel.from_pretrained(GCB_MODEL, add_pooling_layer=False).to(device).eval()
 for p in gcb.parameters():
     p.requires_grad_(False)
 
