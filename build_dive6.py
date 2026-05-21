@@ -1402,6 +1402,101 @@ with open(OUT_DIR / "confusion_per_class.json", "w") as f:
 """)
 
 # ---------------------------------------------------------------------------
+md("""## 21 — End-to-end inference check
+
+Deployment path for a **new** contract ( no cache ): raw source -> split into
+units -> frozen GraphCodeBERT encode -> aggregator -> isotonic calibration ->
+per-class thresholds -> multi-label prediction. The GraphCodeBERT encode
+dominates latency, so the benchmark times the whole path ( batch=1, single GPU ).
+A small qualitative demo prints predicted vs true labels for a few test
+contracts.
+""")
+
+code("""infer_model = eval_model.module if isinstance(eval_model, nn.DataParallel) else eval_model
+infer_model.eval(); gcb.eval()
+
+
+@torch.no_grad()
+def infer_contract(src_text):
+    units = cap_units(split_solidity_units(src_text))
+    texts = [t[:UNIT_CHAR_CAP] for (_, t, _) in units]
+    types = [1 if isf else 0 for (_, _, isf) in units]
+
+    enc = gcb_tokenizer(texts, padding=True, truncation=True,
+                        max_length=UNIT_TOKENS, return_tensors="pt")
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with autocast():
+        hs = gcb(**enc).last_hidden_state
+    mf = enc["attention_mask"].unsqueeze(-1).float()
+    embs = ((hs * mf).sum(1) / mf.sum(1).clamp(min=1.0)).float()
+
+    U = MAX_UNITS
+    n = min(len(units), U)
+    e  = torch.zeros(1, U, EMB_DIM, device=device)
+    m  = torch.zeros(1, U, dtype=torch.bool, device=device)
+    tt = torch.zeros(1, U, dtype=torch.long, device=device)
+    e[0, :n]  = embs[:n]
+    m[0, :n]  = True
+    tt[0, :n] = torch.tensor(types[:n], device=device)
+
+    with autocast():
+        main_logits, _ = infer_model(e, m, tt)
+    raw = torch.sigmoid(main_logits).float().cpu().numpy()[0]
+    cal = np.array([frozen_calibrators[i].transform([raw[i]])[0] for i in range(N_LABELS)])
+    pred = (cal >= frozen_thresholds).astype(int)
+    return cal, pred
+
+
+rng = np.random.RandomState(0)
+demo_rows = rng.choice(idx_te, size=8, replace=False)
+log("=== INFERENCE DEMO (predicted vs true) ===")
+for row in demo_rows:
+    cid = int(df.iloc[row]["contractID"])
+    cal, pred = infer_contract(read_source(cid))
+    true = Y[row].astype(int)
+    pl = [LABEL_COLS[i] for i in range(N_LABELS) if pred[i]]
+    tl = [LABEL_COLS[i] for i in range(N_LABELS) if true[i]]
+    tag = "OK  " if (pred == true).all() else "DIFF"
+    log(f"  [{tag}] contract {cid}")
+    log(f"        pred: {pl}")
+    log(f"        true: {tl}")
+
+
+BENCH_N = 256
+bench_rows = rng.choice(idx_te, size=min(BENCH_N, len(idx_te)), replace=False)
+bench_src = [read_source(int(df.iloc[r]["contractID"])) for r in bench_rows]
+
+for s in bench_src[:8]:        # warmup
+    infer_contract(s)
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+
+lat = []
+for s in bench_src:
+    t0 = time.time()
+    infer_contract(s)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    lat.append((time.time() - t0) * 1000.0)
+lat = np.array(lat)
+
+dev = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+log("=== INFERENCE BENCHMARK (end-to-end: split + GraphCodeBERT + aggregator, batch=1) ===")
+log(f"   device: {dev}")
+log(f"   n_samples: {len(lat)}")
+log(f"      p50_ms: {np.percentile(lat,50):.2f}")
+log(f"      p90_ms: {np.percentile(lat,90):.2f}")
+log(f"     mean_ms: {lat.mean():.2f}")
+log(f"      max_ms: {lat.max():.2f}")
+
+with open(OUT_DIR / "inference_bench.json", "w") as f:
+    json.dump({"device": dev, "n_samples": int(len(lat)),
+               "p50_ms": float(np.percentile(lat, 50)), "p90_ms": float(np.percentile(lat, 90)),
+               "mean_ms": float(lat.mean()), "max_ms": float(lat.max())}, f, indent=2)
+log("Wrote inference_bench.json")
+""")
+
+# ---------------------------------------------------------------------------
 md("""## Summary
 
 **dive-6 = modality switch + transfer learning.** Source instead of bytecode;
