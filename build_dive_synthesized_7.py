@@ -180,7 +180,8 @@ def _find_root(base):
     hits = [h for h in base.rglob("train.csv") if h.parent.name == "splits"]
     return hits[0].parent.parent if hits else None
 
-DATA_ROOT = _find_root("/kaggle/input/dive-synthesized")
+DATA_ROOT = (_find_root("/kaggle/input/datasets/henrychristian7555/dive-synthesized")
+             or _find_root("/kaggle/input/dive-synthesized"))
 if DATA_ROOT is None:
     import kagglehub
     DATA_ROOT = _find_root(kagglehub.dataset_download("henrychristian7555/dive-synthesized"))
@@ -1091,6 +1092,10 @@ val_loader   = DataLoader(ds_v,  batch_size=BATCH_SIZE, shuffle=False,
 test_loader  = DataLoader(ds_te, batch_size=BATCH_SIZE, shuffle=False,
                           num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
                           persistent_workers=NUM_WORKERS > 0)
+# non-augmented sequential pass over TRAIN, for overfit diagnostics (train vs val/test)
+ds_tr_eval = UnitDS(UE_tr, UM_tr, UT_tr, Y_tr, augment=False)
+train_eval_loader = DataLoader(ds_tr_eval, batch_size=BATCH_SIZE, shuffle=False,
+                               num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
 log(f"Batch size: {BATCH_SIZE} | steps/epoch: {len(train_loader)}, total: {len(train_loader)*EPOCHS}")
 """)
 
@@ -1269,18 +1274,25 @@ try:
         val_thr     = tune_thresholds(val_labels, val_probs)
         val_metrics, _ = multilabel_metrics(val_labels, val_probs, val_thr)
         val_metrics_raw_05, _ = multilabel_metrics(val_labels, val_probs_raw, 0.5)
+
+        # train metrics (non-augmented, raw@0.5) — apples-to-apples vs val raw@0.5 for the overfit watch
+        tr_logits, tr_labels = predict(ema.ema, train_eval_loader)
+        train_metrics_raw_05, _ = multilabel_metrics(tr_labels, 1 / (1 + np.exp(-tr_logits)), 0.5)
+        overfit_gap = train_metrics_raw_05["f1_macro"] - val_metrics_raw_05["f1_macro"]
         cur_lr = optimizer.param_groups[0]["lr"]
 
-        log(f"Epoch {epoch:2d}/{EPOCHS} | train_dt={train_dt:5.1f}s | "
-            f"lr={cur_lr:.2e} | train_loss={train_loss:.4f} | "
-            f"EMA val (calib+thr): f1_macro={val_metrics['f1_macro']:.4f} "
-            f"f1_micro={val_metrics['f1_micro']:.4f} ham={val_metrics['hamming_loss']:.4f} | "
-            f"raw@0.5: f1_macro={val_metrics_raw_05['f1_macro']:.4f}")
+        log(f"Epoch {epoch:2d}/{EPOCHS} | train_dt={train_dt:5.1f}s | lr={cur_lr:.2e} | "
+            f"train_loss={train_loss:.4f} | f1_macro raw@0.5 "
+            f"train={train_metrics_raw_05['f1_macro']:.4f} val={val_metrics_raw_05['f1_macro']:.4f} "
+            f"(gap={overfit_gap:+.4f}) | EMA val calib+thr f1_macro={val_metrics['f1_macro']:.4f} "
+            f"f1_micro={val_metrics['f1_micro']:.4f} ham={val_metrics['hamming_loss']:.4f}")
 
         history.append({
             "epoch": epoch, "train_loss": train_loss, "lr": cur_lr,
             "train_dt": train_dt, **val_metrics,
             "val_f1_macro_raw_05": val_metrics_raw_05["f1_macro"],
+            "train_f1_macro_raw_05": train_metrics_raw_05["f1_macro"],
+            "overfit_gap_f1_macro_raw_05": overfit_gap,
         })
         _flush_history()
 
@@ -1432,6 +1444,66 @@ for i, lab in enumerate(LABEL_COLS):
     cms[lab] = cm.tolist()
 with open(OUT_DIR / "confusion_per_class.json", "w") as f:
     json.dump(cms, f, indent=2)
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 20b — Metrics graphics: train / val / test ( overfit check )
+
+Two figures, saved to `/kaggle/working/` and shown inline:
+1. **Training curves** — `train_loss` plus train vs val macro-F1 (raw@0.5,
+   apples-to-apples) and the deployed val macro-F1 (calibrated + tuned).
+   Train F1 climbing while val F1 flattens/drops = overfitting.
+2. **Per-class F1 bars across train / val / test** at the best model
+   (calibrated + frozen thresholds). A large train >> val/test gap = overfitting.
+""")
+
+code("""try:
+    import matplotlib.pyplot as plt
+
+    hist = pd.DataFrame(history)
+
+    # (1) training curves: loss + train/val macro-F1 (raw@0.5, apples-to-apples)
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.plot(hist["epoch"], hist["train_loss"], color="tab:gray", label="train_loss")
+    ax1.set_xlabel("epoch"); ax1.set_ylabel("train loss", color="tab:gray")
+    ax2 = ax1.twinx()
+    if "train_f1_macro_raw_05" in hist:
+        ax2.plot(hist["epoch"], hist["train_f1_macro_raw_05"], color="tab:blue", label="train F1 (raw@0.5)")
+    ax2.plot(hist["epoch"], hist["val_f1_macro_raw_05"], color="tab:orange", label="val F1 (raw@0.5)")
+    ax2.plot(hist["epoch"], hist["f1_macro"], color="tab:green", linestyle="--", label="val F1 (calib+thr)")
+    ax2.set_ylabel("macro-F1"); ax2.set_ylim(0, 1)
+    lines = ax1.get_lines() + ax2.get_lines()
+    ax2.legend(lines, [ln.get_label() for ln in lines], loc="lower right", fontsize=8)
+    plt.title("dive-synthesized-7 — training curves (overfit watch)")
+    fig.tight_layout(); fig.savefig(OUT_DIR / "curves_overfit.png", dpi=120); plt.show(); plt.close(fig)
+
+    # (2) per-class F1 across train / val / test at the best model (calibrated + frozen thresholds)
+    def _fold_f1(loader):
+        lg, lb = predict(eval_model, loader)
+        pr = apply_calibration(1 / (1 + np.exp(-lg)), frozen_calibrators)
+        _, pc = multilabel_metrics(lb, pr, frozen_thresholds)
+        return [pc[c]["f1"] for c in LABEL_COLS]
+
+    f1_train = _fold_f1(train_eval_loader)
+    f1_val   = _fold_f1(val_loader)
+    f1_test  = [per_class_tuned[c]["f1"] for c in LABEL_COLS]
+
+    x = np.arange(N_LABELS); bw = 0.27
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x - bw, f1_train, bw, label=f"train (macro {np.mean(f1_train):.3f})")
+    ax.bar(x,      f1_val,   bw, label=f"val (macro {np.mean(f1_val):.3f})")
+    ax.bar(x + bw, f1_test,  bw, label=f"test (macro {np.mean(f1_test):.3f})")
+    ax.set_xticks(x); ax.set_xticklabels(LABEL_COLS, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("F1 (calibrated + frozen thresholds)"); ax.set_ylim(0, 1)
+    ax.set_title("dive-synthesized-7 — per-class F1: train vs val vs test")
+    ax.legend(); fig.tight_layout()
+    fig.savefig(OUT_DIR / "per_class_f1_train_val_test.png", dpi=120); plt.show(); plt.close(fig)
+
+    pd.DataFrame({"class": LABEL_COLS, "f1_train": f1_train, "f1_val": f1_val, "f1_test": f1_test}).to_csv(OUT_DIR / "f1_train_val_test.csv", index=False)
+    log("Saved graphics: curves_overfit.png, per_class_f1_train_val_test.png, f1_train_val_test.csv")
+    log(f"macro-F1 (calib+thr)  train={np.mean(f1_train):.4f}  val={np.mean(f1_val):.4f}  test={np.mean(f1_test):.4f}  (train-test gap={np.mean(f1_train)-np.mean(f1_test):+.4f})")
+except Exception as e:
+    log(f"Metrics plotting skipped due to error: {e!r}")
 """)
 
 # ---------------------------------------------------------------------------
