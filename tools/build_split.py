@@ -2,10 +2,10 @@
 Build the canonical split as CSVs so the FINAL (real + synthetic) dataset is
 80/10/10, with every synthetic row living in train only.
 
-Inputs (Dataset/):
-  DIVE_Labels.csv              real labels            (R = 22,330)
-  synthetic_injected_labels.csv synthetic labels      (S = 6,138, contractID >= 1_000_000)
-  synthetic_provenance.csv     base_id -> real parent (all parents are clean)
+Inputs:
+  Dataset/backup/DIVE_Labels.csv                  real labels   (R = 22,330)
+  Dataset/synthetic/synthetic_injected_labels.csv synthetic     (S = 6,138, contractID >= 1_000_000)
+  Dataset/synthetic/synthetic_provenance.csv      base_id -> real parent (all parents clean)
 
 Strategy: pin every synthetic parent (all clean/all-zero) into train, then
 multilabel-stratify the remaining real contracts into rest-of-train / val / test
@@ -31,9 +31,9 @@ LAB = ["Reentrancy", "Access Control", "Arithmetic", "Unchecked Return Values",
        "DoS", "Bad Randomness", "Front Running", "Time manipulation"]
 COLS = ["contractID"] + LAB
 
-real = pd.read_csv(DATA / "DIVE_Labels.csv")[COLS]
-syn = pd.read_csv(DATA / "synthetic_injected_labels.csv")[COLS]
-prov = pd.read_csv(DATA / "synthetic_provenance.csv")
+real = pd.read_csv(DATA / "backup" / "DIVE_Labels.csv")[COLS]
+syn = pd.read_csv(DATA / "synthetic" / "synthetic_injected_labels.csv")[COLS]
+prov = pd.read_csv(DATA / "synthetic" / "synthetic_provenance.csv")
 
 R, S = len(real), len(syn)
 T = R + S
