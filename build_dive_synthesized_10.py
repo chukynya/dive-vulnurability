@@ -163,26 +163,89 @@ Edit **only** this cell to switch between fresh run and resume.
 
 code("""# -- Paths --------------------------------------------------------------------
 def _find_root(base):
+    \"\"\"Find dataset root by locating a splits or final directory with a CSV.\"\"\"
     base = Path(base)
     if not base.exists():
         return None
-    hits = [h for h in base.rglob("train.csv") if h.parent.name == "splits"]
-    return hits[0].parent.parent if hits else None
+    # Support both rm-sc-test layout (splits/train.csv) and
+    # dataset-generation layout (splits/Train_Labels.csv, final/Train_Labels.csv)
+    for pattern in ("train.csv", "Train_Labels.csv"):
+        hits = [h for h in base.rglob(pattern) if h.parent.name in ("splits", "final")]
+        if hits:
+            return hits[0].parent.parent
+    return None
 
 DATA_ROOT = (_find_root("/kaggle/input/datasets/henrychristian7555/dive-synthesized")
              or _find_root("/kaggle/input/dive-synthesized"))
 if DATA_ROOT is None:
     import kagglehub
     DATA_ROOT = _find_root(kagglehub.dataset_download("henrychristian7555/dive-synthesized"))
-assert DATA_ROOT is not None, "dive-synthesized dataset not found (no splits/train.csv under it)"
+assert DATA_ROOT is not None, "dive-synthesized dataset not found"
 
-SPLIT_DIR   = DATA_ROOT / "splits"
-REAL_SRC    = DATA_ROOT / "backup" / "Source"
-SYNTH_SRC   = DATA_ROOT / "synthetic" / "Source_Synthetic"
+SPLIT_DIR  = DATA_ROOT / "splits"
+_FINAL_DIR = DATA_ROOT / "final"
+
+# Detect layout:
+#   NEW  (dataset-generation): final/train/, final/val/, final/test/ exist;
+#                               split CSVs are Train_Labels.csv / Val_Labels.csv / Test_Labels.csv
+#   LEGACY (rm-sc-test):        backup/Source/ + synthetic/Source_Synthetic/;
+#                               split CSVs are train.csv / val.csv / test.csv
+_LAYOUT_NEW = (_FINAL_DIR / "train").exists()
+
+if _LAYOUT_NEW:
+    _FOLD_SRCDIRS = {
+        "train": _FINAL_DIR / "train",
+        "val":   _FINAL_DIR / "val",
+        "test":  _FINAL_DIR / "test",
+    }
+else:
+    REAL_SRC  = DATA_ROOT / "backup" / "Source"
+    SYNTH_SRC = DATA_ROOT / "synthetic" / "Source_Synthetic"
+
+# sol_path: resolve contractID -> .sol file path (with per-run cache)
+_sol_cache = {}
 
 def sol_path(cid):
-    cid = int(cid)
-    return (SYNTH_SRC / f"{cid}.sol") if cid >= 1_000_000 else (REAL_SRC / f"{cid}.sol")
+    cid_s = str(cid)
+    if cid_s in _sol_cache:
+        return _sol_cache[cid_s]
+    if _LAYOUT_NEW:
+        for d in _FOLD_SRCDIRS.values():
+            p = d / f"{cid_s}.sol"
+            if p.exists():
+                _sol_cache[cid_s] = p
+                return p
+        return _FOLD_SRCDIRS["train"] / f"{cid_s}.sol"   # missing → caught by coverage check
+    else:
+        try:
+            cid_i = int(cid_s)
+            return (SYNTH_SRC / f"{cid_i}.sol") if cid_i >= 1_000_000 else (REAL_SRC / f"{cid_i}.sol")
+        except (ValueError, TypeError):
+            return REAL_SRC / f"{cid_s}.sol"
+
+def _fold_csv(name):
+    \"\"\"Return path to the split CSV for fold 'train', 'val', or 'test'.\"\"\"
+    if _LAYOUT_NEW:
+        # For train: prefer final/Train_Labels.csv (includes synthetic)
+        cap = name.capitalize()
+        candidates = (
+            [_FINAL_DIR / f"{cap}_Labels.csv", SPLIT_DIR / f"{cap}_Labels.csv"]
+            if name == "train"
+            else [SPLIT_DIR / f"{cap}_Labels.csv", _FINAL_DIR / f"{cap}_Labels.csv"]
+        )
+    else:
+        cap = name.capitalize()
+        candidates = [SPLIT_DIR / f"{name}.csv", SPLIT_DIR / f"{cap}_Labels.csv"]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"No split CSV for fold '{name}' — tried: {candidates}")
+
+def _is_synthetic(cid):
+    try:
+        return int(str(cid)) >= 1_000_000
+    except (ValueError, TypeError):
+        return True   # non-numeric IDs (e.g. buggy_1419_TOD) are synthetic
 
 OUT_DIR     = Path("/kaggle/working");   OUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR   = OUT_DIR / "cache";         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -261,10 +324,15 @@ MIN_SOURCE_COVERAGE = 0.99        # >=99% of label rows must have a .sol file
 MIN_UNIT_COVERAGE   = 0.99        # >=99% of contracts must yield >=1 unit
 STAGE1_BUDGET_SECS  = 4 * 3600    # abort if estimated stage-1 encode exceeds this
 
-# -- Sanity check on data files ----------------------------------------------
-assert SPLIT_DIR.exists(), f"Missing splits dir {SPLIT_DIR}"
-assert REAL_SRC.exists(),  f"Missing real source dir {REAL_SRC}"
-assert SYNTH_SRC.exists(), f"Missing synthetic source dir {SYNTH_SRC}"
+# -- Sanity check on data files -----------------------------------------------
+assert SPLIT_DIR.exists() or _FINAL_DIR.exists(), f"Missing splits dir {SPLIT_DIR}"
+if _LAYOUT_NEW:
+    assert (_FINAL_DIR / "train").exists(), f"Missing final/train dir {_FINAL_DIR/'train'}"
+    print(f"Layout: new (final/)  FINAL_DIR={_FINAL_DIR}", flush=True)
+else:
+    assert REAL_SRC.exists(),  f"Missing real source dir {REAL_SRC}"
+    assert SYNTH_SRC.exists(), f"Missing synthetic source dir {SYNTH_SRC}"
+    print(f"Layout: legacy (backup+synthetic)  REAL_SRC={REAL_SRC}", flush=True)
 print("Inputs OK:", DATA_ROOT, flush=True)
 print("RESUME_FROM:", RESUME_FROM, flush=True)
 print(f"Stage1: MAX_UNITS={MAX_UNITS} UNIT_TOKENS={UNIT_TOKENS} model={GCB_MODEL}", flush=True)
@@ -337,7 +405,7 @@ expected to be 100%. **No re-splitting** — the folds are fixed and leakage-saf
 """)
 
 code("""def _load_fold(name):
-    d = pd.read_csv(SPLIT_DIR / f"{name}.csv")
+    d = pd.read_csv(_fold_csv(name))
     have = d["contractID"].apply(lambda c: sol_path(c).exists())
     cov = have.mean()
     log(f"  {name:>5s}: {len(d):6d} rows | source coverage {cov:.2%}")
@@ -349,11 +417,11 @@ train_df = _load_fold("train")
 val_df   = _load_fold("val")
 test_df  = _load_fold("test")
 
-n_syn_eval = int((pd.concat([val_df, test_df])["contractID"] >= 1_000_000).sum())
+n_syn_eval = int(pd.concat([val_df, test_df])["contractID"].apply(_is_synthetic).sum())
 assert n_syn_eval == 0, f"Leakage: {n_syn_eval} synthetic rows in val/test"
 
 df = pd.concat([train_df, val_df, test_df], ignore_index=True)
-log(f"Working set: {df.shape} | train synthetic={int((train_df['contractID']>=1_000_000).sum())}")
+log(f"Working set: {df.shape} | train synthetic={int(train_df['contractID'].apply(_is_synthetic).sum())}")
 log("Positives per class (train fold):")
 for c in LABEL_COLS:
     log(f"  {c:>26s}  {int(train_df[c].sum()):>5d}")
@@ -1621,7 +1689,7 @@ rng = np.random.RandomState(0)
 demo_rows = rng.choice(idx_te, size=8, replace=False)
 log("=== INFERENCE DEMO (predicted vs true) ===")
 for row in demo_rows:
-    cid = int(df.iloc[row]["contractID"])
+    cid = df.iloc[row]["contractID"]
     cal, pred = infer_contract(read_source(cid))
     true = Y[row].astype(int)
     pl = [LABEL_COLS[i] for i in range(N_LABELS) if pred[i]]
@@ -1634,7 +1702,7 @@ for row in demo_rows:
 
 BENCH_N = 256
 bench_rows = rng.choice(idx_te, size=min(BENCH_N, len(idx_te)), replace=False)
-bench_src = [read_source(int(df.iloc[r]["contractID"])) for r in bench_rows]
+bench_src = [read_source(df.iloc[r]["contractID"]) for r in bench_rows]
 
 for s in bench_src[:8]:        # warmup
     infer_contract(s)
