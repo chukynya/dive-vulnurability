@@ -1,4 +1,27 @@
-"""Build dive-synthesized-7.ipynb: dive-6 (GraphCodeBERT, frozen, source units) trained on the synthetic-augmented 80/10/10 dive-synthesized dataset.
+"""Build dive-synthesized-11.ipynb: a *valid* augmentation ablation on ONE fixed real test set.
+
+WHY THIS NOTEBOOK EXISTS. dive-9 (test macro-F1 0.7854) and dive-10 (0.7634) were
+NOT comparable: they scored on different test sets (rm-sc-test 2,847-row test vs.
+dataset-generation 4,466-row test — every class's support scaled ~1.46x). And the
+two real splits are independent partitions of the same 22,330 contracts, so 3,272
+of dive-9's *training* contracts fall inside dive-10's test set — re-scoring dive-9's
+model on the new test would leak ~3,900 trained contracts. The only valid comparison
+is to RETRAIN on the dataset-generation real split and toggle ONLY the training-side
+augmentation source, scoring every arm on the same frozen 4,466-row real test.
+
+This script is dive-10 EXCEPT for: the `AUG_SOURCE` knob (cell 2) that filters the
+train fold, the leakage + identical-test gates (cell 5), arm-suffixed output paths,
+and a final comparison-table cell. Model, hparams, loss, calibration, thresholds,
+seed, and the training loop are unchanged — so any F1 delta is attributable to the
+training data, not the yardstick.
+
+ARMS (set `AUG_SOURCE` in cell 2, run the notebook once per arm in the same session):
+  - "none"  — real train only (the control): IDs that are real digits < 1,000,000.
+  - "buggy" — real + the curated buggy_* contracts (= exactly dive-10; reproduces 0.7634).
+  - "llm"   — real + dive-9's LLM synthetic_* contracts (IDs >= 1,000,000). Requires the
+              LLM .sol + their label rows present in the upload; self-skips with a log if absent.
+
+---- original dive-10 design notes (unchanged) ----
 
 dive-2..5 were all bytecode-only and trained the encoder from scratch on 22k
 contracts — which caps the rare classes (Front Running / Bad Randomness / DoS:
@@ -57,58 +80,50 @@ def code(text: str):
 
 
 # ---------------------------------------------------------------------------
-md("""# dive-synthesized-7 — dive-6 (GraphCodeBERT, frozen) + synthetic-augmented 80/10/10
+md("""# dive-synthesized-11 — valid augmentation ablation on ONE fixed real test set
 
-**This run.** Architecture and scaffold are *identical to dive-6*; the only change is the
-**training data** — it loads the pre-split `dive-synthesized` dataset (80/10/10) whose
-**train fold adds 6,138 synthetic source contracts** to lift the rare classes (Front
-Running, Bad Randomness, DoS). Val/test are real-only and leakage-safe. Baseline to beat:
-dive-6 test macro-F1 **0.768**.
+**The problem this fixes.** dive-9 (0.7854) and dive-10 (0.7634) were scored on
+**different test sets** — rm-sc-test's 2,847-row test vs. dataset-generation's
+4,466-row test (every class's support scaled ~1.46x). That headline "regression" is a
+measurement artifact, not a real effect. Worse, the two real splits are independent
+partitions of the same 22,330 contracts, so **3,272 of dive-9's training contracts sit
+inside dive-10's test set** — you cannot simply re-score dive-9's model on the new test.
 
-**Why this notebook.** dive-2..5 were bytecode-only and trained the encoder
-from scratch. The per-class picture at dive-5 (macro-F1 0.747) is dragged by
-three classes whose ROC-AUC is high but precision/AP is low — Front Running
-(F1 0.57, AUC 0.97), Bad Randomness (0.65, AUC 0.96), DoS (0.63). That
-signature — *ranks well, calibrates badly* — is data scarcity, not an
-architecture limit. We've also been ignoring the richest modality: the 22,330
-Solidity **source** files, where the actual vulnerability fingerprints live
-(`onlyOwner`, `require` placement, `block.timestamp`, `.call{value:}` ordering,
-`tx.origin`).
+**The fix.** Hold the *test set fixed* (dataset-generation 4,466-row real test), retrain
+the identical model on the fixed real train split, and toggle **only** the training-side
+augmentation via `AUG_SOURCE`. Then any macro-F1 difference is attributable to the data.
 
-dive-6 switches the input to source and uses a **pretrained** code model so the
-rare classes inherit transfer priors instead of learning from ~450 positives.
+**Arms** (set `AUG_SOURCE` in cell 2; run the notebook once per arm in the same session
+so the per-arm `metrics_arm_*.json` accumulate and the final cell can tabulate them):
 
-## What's new vs dive-5
+| `AUG_SOURCE` | Train fold | Answers |
+|---|---|---|
+| `"none"` | real only (15,631) | the control — does *any* augmentation help? |
+| `"buggy"` | real + curated buggy_* (21,031) | = exactly dive-10; should reproduce **0.7634** |
+| `"llm"`  | real + dive-9 LLM synthetic_* (IDs ≥1M) | dive-9's augmentation, scored fairly |
 
-| Change | Why |
-|---|---|
-| **Modality: Solidity source** (was: EVM bytecode) | Source carries the densest, most direct vulnerability signal; bytecode mangles it. |
-| **GraphCodeBERT-base, encoder-only, FROZEN** | Transfer learning is the standard low-resource fix and directly targets the rare-class precision ceiling. No Solidity data-flow extractor exists, so we use it as a code encoder (no DFG input). |
-| **Function-level units** (split each contract into function/header units, <=256 tokens each) | GraphCodeBERT caps at 512 tokens; these flattened contracts have a median ~46 function/modifier decls. Vulnerabilities are mostly function-local, so this aligns with the signal. |
-| **Two-stage (cache then train)** | End-to-end FT over ~46 units x 22k x 30 epochs is ~10-30x an 8h T4 budget. Stage 1 caches frozen unit embeddings once (forward-only); stage 2 trains a tiny aggregator in seconds/epoch. |
-| **Set-Transformer aggregator** (no positional encoding, + unit-type embedding) | Unit order in flattened source is arbitrary -> permutation-invariant pooling is the correct prior. A 2-entry type embedding separates `contract`-header units (access-control / storage) from function units. |
-| **Risk-ranked unit cap (MAX_UNITS=32)** | When a contract exceeds the cap, keep contract headers + functions ranked by visibility (`external/public/payable`) and risky sinks (`call/delegatecall/selfdestruct/block.timestamp/...`), so boilerplate getters drop before risky functions. |
-| **Unit-dropout + unit-level CutMix** (replace token span-mask + token CutMix) | Augmentation now operates on the unit set, not tokens. |
+All arms share the **same val (2,233) and test (4,466) real folds**, the same model,
+hparams, loss, calibration, thresholds, sampler, EMA, and seed. The `"llm"` arm needs the
+LLM `.sol` + their label rows in the upload; it self-skips with a clear log if they're absent.
 
-## What stays identical to dive-5
+## What stays identical across arms (and to dive-10)
 
-- Multilabel-stratified 80/10/10 split, seed 42.
-- AsymmetricLossWeighted (g-=4, g+=1, clip=0.05) + sqrt-inv-freq per-class
-  weights clipped to [1,5], + 0.3*BCE aux head on (Bad Randomness, Front Running).
+- Frozen GraphCodeBERT + function-level unit splitting (MAX_UNITS=32, UNIT_TOKENS=256).
+- Set-Transformer aggregator: d_model=384, 6 heads, 3 layers, d_ff=1024.
+- DROPOUT=0.30, DROP_PATH=0.20, WEIGHT_DECAY=0.10.
+- AsymmetricLossWeighted (g-=4, g+=1, clip=0.05) + 0.3*BCE aux head on (Bad Randomness, Front Running).
 - EMA decay 0.999, AdamW with selective weight decay, cosine warmup, grad clip 1.0.
 - WeightedRandomSampler (sqrt-inv-freq per-sample weights, clipped [1,5]).
-- Per-class isotonic calibration on val -> 41-pt threshold tune (min-precision
-  0.25 for classes with val support < 200).
-- Atomic full-state checkpointing every epoch + every 30 min, tee logger,
-  history.csv. **`torch.load(weights_only=False)`** baked in.
+- Per-class isotonic calibration on val -> 41-pt threshold tune (min-precision 0.25 for support < 200).
+- Atomic full-state checkpointing, tee logger, history.csv.
 
 ## Reading the result
 
-1. **Gate logs (cells 4-8):** source coverage, units/contract, tokens/unit
-   truncation, and the stage-1 timing estimate.
-2. **`test_calibrated_tuned.f1_macro` vs dive-5's 0.7471** — the modality delta.
-3. **Per-class F1 on Front Running / Bad Randomness / DoS** — the targeted
-   classes; transfer learning is the lever.
+1. **Gates (cell 5):** leakage (train∩test=0, aug absent from val/test) + identical-test
+   (4,466 rows, fixed per-class support) MUST pass before training — printed up front.
+2. **`test_calibrated_tuned.f1_macro` per arm**, all on the 4,466 test — the valid number.
+3. **Final cell:** the comparison table {none, buggy, llm} × macro-F1 + per-class F1
+   (focus BR/FR/DoS). Read off whether augmentation beats the real-only control.
 """)
 
 # ---------------------------------------------------------------------------
@@ -168,41 +183,147 @@ Edit **only** this cell to switch between fresh run and resume.
 - `RESUME_FROM = None` -> fresh training, fresh checkpoint at `last_state.pt`.
 - `RESUME_FROM = "/kaggle/working/last_state.pt"` -> continue from saved state.
   Optimizer / scheduler / scaler / RNG / EMA / epoch / history / best-metric /
-  calibrators are restored. The stage-1 embedding cache (`dive_synth7_units.npz`) is
+  calibrators are restored. The stage-1 embedding cache (`dive_synth11_units.npz`) is
   reused if present, so resuming never re-encodes.
 """)
 
 code("""# -- Paths --------------------------------------------------------------------
 def _find_root(base):
+    \"\"\"Find dataset root: look for any directory named 'splits' or 'final' that
+    contains at least one CSV — works regardless of exact file naming.\"\"\"
     base = Path(base)
     if not base.exists():
         return None
-    hits = [h for h in base.rglob("train.csv") if h.parent.name == "splits"]
-    return hits[0].parent.parent if hits else None
+    for d in sorted(base.rglob("*")):      # sorted = deterministic
+        if d.is_dir() and d.name in ("splits", "final"):
+            if any(d.glob("*.csv")):
+                return d.parent
+    return None
 
-DATA_ROOT = (_find_root("/kaggle/input/datasets/henrychristian7555/dive-synthesized")
-             or _find_root("/kaggle/input/dive-synthesized"))
+_DS_BASE = Path("/kaggle/input/datasets/henrychristian7555/dive-synthesized")
+DATA_ROOT = _find_root(_DS_BASE) or _find_root(Path("/kaggle/input/dive-synthesized"))
 if DATA_ROOT is None:
+    # Diagnostic: show top-level layout before failing
+    if _DS_BASE.exists():
+        print("Dataset base found. Contents:", flush=True)
+        for _p in sorted(_DS_BASE.rglob("*")):
+            if _p.is_dir() or _p.suffix == ".csv":
+                print(f"  {_p.relative_to(_DS_BASE)}", flush=True)
     import kagglehub
     DATA_ROOT = _find_root(kagglehub.dataset_download("henrychristian7555/dive-synthesized"))
-assert DATA_ROOT is not None, "dive-synthesized dataset not found (no splits/train.csv under it)"
+assert DATA_ROOT is not None, (
+    f"dive-synthesized dataset not found — could not locate a 'splits/' or 'final/' "
+    f"directory containing CSV files under {_DS_BASE}"
+)
 
-SPLIT_DIR   = DATA_ROOT / "splits"
-REAL_SRC    = DATA_ROOT / "backup" / "Source"
-SYNTH_SRC   = DATA_ROOT / "synthetic" / "Source_Synthetic"
+SPLIT_DIR  = DATA_ROOT / "splits"
+_FINAL_DIR = DATA_ROOT / "final"
+
+# Detect layout:
+#   NEW  (dataset-generation): final/train/, final/val/, final/test/ exist;
+#                               split CSVs are Train_Labels.csv / Val_Labels.csv / Test_Labels.csv
+#   LEGACY (rm-sc-test):        backup/Source/ + synthetic/Source_Synthetic/;
+#                               split CSVs are train.csv / val.csv / test.csv
+_LAYOUT_NEW = (_FINAL_DIR / "train").exists()
+
+if _LAYOUT_NEW:
+    _FOLD_SRCDIRS = {
+        "train": _FINAL_DIR / "train",
+        "val":   _FINAL_DIR / "val",
+        "test":  _FINAL_DIR / "test",
+    }
+else:
+    REAL_SRC  = DATA_ROOT / "backup" / "Source"
+    SYNTH_SRC = DATA_ROOT / "synthetic" / "Source_Synthetic"
+
+# sol_path: resolve contractID -> .sol file path (with per-run cache)
+_sol_cache = {}
 
 def sol_path(cid):
-    cid = int(cid)
-    return (SYNTH_SRC / f"{cid}.sol") if cid >= 1_000_000 else (REAL_SRC / f"{cid}.sol")
+    cid_s = str(cid)
+    if cid_s in _sol_cache:
+        return _sol_cache[cid_s]
+    if _LAYOUT_NEW:
+        search = list(_FOLD_SRCDIRS.values())
+        # the "llm" arm's synthetic .sol live outside the fold dirs — scan those too
+        search += [d for d in globals().get("LLM_SRC_DIRS", []) if Path(d).exists()]
+        for d in search:
+            p = d / f"{cid_s}.sol"
+            if p.exists():
+                _sol_cache[cid_s] = p
+                return p
+        return _FOLD_SRCDIRS["train"] / f"{cid_s}.sol"   # missing → caught by coverage check
+    else:
+        try:
+            cid_i = int(cid_s)
+            return (SYNTH_SRC / f"{cid_i}.sol") if cid_i >= 1_000_000 else (REAL_SRC / f"{cid_i}.sol")
+        except (ValueError, TypeError):
+            return REAL_SRC / f"{cid_s}.sol"
+
+def _fold_csv(name):
+    \"\"\"Return path to the split CSV for fold 'train', 'val', or 'test'.\"\"\"
+    if _LAYOUT_NEW:
+        # For train: prefer final/Train_Labels.csv (includes synthetic)
+        cap = name.capitalize()
+        candidates = (
+            [_FINAL_DIR / f"{cap}_Labels.csv", SPLIT_DIR / f"{cap}_Labels.csv"]
+            if name == "train"
+            else [SPLIT_DIR / f"{cap}_Labels.csv", _FINAL_DIR / f"{cap}_Labels.csv"]
+        )
+    else:
+        cap = name.capitalize()
+        candidates = [SPLIT_DIR / f"{name}.csv", SPLIT_DIR / f"{cap}_Labels.csv"]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"No split CSV for fold '{name}' — tried: {candidates}")
+
+def _is_synthetic(cid):
+    try:
+        return int(str(cid)) >= 1_000_000
+    except (ValueError, TypeError):
+        return True   # non-numeric IDs (e.g. buggy_1419_TOD) are synthetic
+
+def _aug_kind(cid):
+    \"\"\"Classify a contractID for the augmentation ablation:
+       'real'  — real Etherscan contract (numeric ID < 1,000,000),
+       'llm'   — dive-9 LLM synthetic   (numeric ID >= 1,000,000),
+       'buggy' — curated buggy_* / other non-numeric synthetic.\"\"\"
+    s = str(cid)
+    if s.isdigit():
+        return "llm" if int(s) >= 1_000_000 else "real"
+    return "buggy"
+
+# === ABLATION KNOB ===========================================================
+# Which training-side augmentation to layer on top of the FIXED real train split.
+# Run the notebook once per value in the same Kaggle session; per-arm metrics are
+# written to metrics_arm_<AUG_SOURCE>.json and the final cell tabulates all arms.
+#   "none"  -> real only (control)
+#   "buggy" -> real + curated buggy_* (== dive-10)
+#   "llm"   -> real + dive-9 LLM synthetic_* (IDs >= 1,000,000); needs LLM sources present
+AUG_SOURCE = "buggy"
+assert AUG_SOURCE in ("none", "buggy", "llm"), f"bad AUG_SOURCE {AUG_SOURCE!r}"
+
+# Optional extra source dir for the "llm" arm (dive-9 synthetic .sol live here on the
+# upload). Scanned by sol_path in addition to the fold dirs. Harmless if it doesn't exist.
+LLM_SRC_DIRS = [DATA_ROOT / "synthetic_llm",
+                DATA_ROOT / "synthetic" / "Source_Synthetic",
+                _FINAL_DIR / "train_llm"]
+# Optional extra label CSV for the "llm" arm (contractID + 8 class cols for the LLM rows).
+LLM_LABELS_CANDIDATES = [DATA_ROOT / "splits" / "Train_Labels_llm.csv",
+                         _FINAL_DIR / "Train_Labels_llm.csv",
+                         DATA_ROOT / "Train_Labels_llm.csv"]
 
 OUT_DIR     = Path("/kaggle/working");   OUT_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR   = OUT_DIR / "cache";         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_PATH    = OUT_DIR / "dive_synth7_train.log"
-HIST_CSV    = OUT_DIR / "history.csv"
-HIST_JSON   = OUT_DIR / "history.json"
-STATE_PATH  = OUT_DIR / "last_state.pt"
-BEST_PATH   = OUT_DIR / "best_model.pt"
-EMB_NPZ     = CACHE_DIR / "dive_synth7_units.npz"
+_ARM        = AUG_SOURCE   # short alias for path suffixes
+LOG_PATH    = OUT_DIR / f"dive_synth11_{_ARM}_train.log"
+HIST_CSV    = OUT_DIR / f"history_{_ARM}.csv"
+HIST_JSON   = OUT_DIR / f"history_{_ARM}.json"
+STATE_PATH  = OUT_DIR / f"last_state_{_ARM}.pt"
+BEST_PATH   = OUT_DIR / f"best_model_{_ARM}.pt"
+EMB_NPZ     = CACHE_DIR / f"dive_synth11_units_{_ARM}.npz"
+METRICS_ARM_JSON = OUT_DIR / f"metrics_arm_{_ARM}.json"
 
 # -- Resume control -----------------------------------------------------------
 RESUME_FROM = None    # set to str(STATE_PATH) to resume
@@ -229,14 +350,14 @@ D_MODEL   = 384
 N_HEADS   = 6
 N_LAYERS  = 3
 D_FF      = 1024
-DROPOUT   = 0.20
-DROP_PATH = 0.10
+DROPOUT   = 0.30
+DROP_PATH = 0.20
 
 # -- Training -----------------------------------------------------------------
 BATCH_SIZE   = 128
 EPOCHS       = 40
 LR           = 3e-4
-WEIGHT_DECAY = 0.05
+WEIGHT_DECAY = 0.10
 GRAD_CLIP    = 1.0
 WARMUP_RATIO = 0.10
 PATIENCE     = 12
@@ -272,10 +393,15 @@ MIN_SOURCE_COVERAGE = 0.99        # >=99% of label rows must have a .sol file
 MIN_UNIT_COVERAGE   = 0.99        # >=99% of contracts must yield >=1 unit
 STAGE1_BUDGET_SECS  = 4 * 3600    # abort if estimated stage-1 encode exceeds this
 
-# -- Sanity check on data files ----------------------------------------------
-assert SPLIT_DIR.exists(), f"Missing splits dir {SPLIT_DIR}"
-assert REAL_SRC.exists(),  f"Missing real source dir {REAL_SRC}"
-assert SYNTH_SRC.exists(), f"Missing synthetic source dir {SYNTH_SRC}"
+# -- Sanity check on data files -----------------------------------------------
+assert SPLIT_DIR.exists() or _FINAL_DIR.exists(), f"Missing splits dir {SPLIT_DIR}"
+if _LAYOUT_NEW:
+    assert (_FINAL_DIR / "train").exists(), f"Missing final/train dir {_FINAL_DIR/'train'}"
+    print(f"Layout: new (final/)  FINAL_DIR={_FINAL_DIR}", flush=True)
+else:
+    assert REAL_SRC.exists(),  f"Missing real source dir {REAL_SRC}"
+    assert SYNTH_SRC.exists(), f"Missing synthetic source dir {SYNTH_SRC}"
+    print(f"Layout: legacy (backup+synthetic)  REAL_SRC={REAL_SRC}", flush=True)
 print("Inputs OK:", DATA_ROOT, flush=True)
 print("RESUME_FROM:", RESUME_FROM, flush=True)
 print(f"Stage1: MAX_UNITS={MAX_UNITS} UNIT_TOKENS={UNIT_TOKENS} model={GCB_MODEL}", flush=True)
@@ -285,7 +411,7 @@ print(f"Stage2: d_model={D_MODEL} n_heads={N_HEADS} n_layers={N_LAYERS} d_ff={D_
 # ---------------------------------------------------------------------------
 md("""## 3 — `tee` logger
 
-Mirrors stdout to `dive_synth7_train.log`. Survives Kaggle "Save Version" and is
+Mirrors stdout to `dive_synth11_train.log`. Survives Kaggle "Save Version" and is
 reopened in append mode so it persists across resumes.
 """)
 
@@ -338,33 +464,109 @@ gcb_dp = nn.DataParallel(gcb) if n_gpus > 1 else gcb
 """)
 
 # ---------------------------------------------------------------------------
-md("""## 5 — Load the pre-split folds ( verification gate #2 )
+md("""## 5 — Load folds, apply `AUG_SOURCE`, and run the verification gates
 
-Load `train/val/test.csv` from the **dive-synthesized** dataset. `train` already
-contains the 6,138 synthetic contracts (`contractID >= 1_000_000`); `val`/`test`
-are real-only. Each row is filtered to those with a resolvable `.sol`
-(real -> backup/Source, synthetic -> synthetic/Source_Synthetic); coverage is
-expected to be 100%. **No re-splitting** — the folds are fixed and leakage-safe.
+`val`/`test` are loaded once and are **fixed across all arms** (the real-only
+benchmark). The `train` fold is loaded in full (real + curated buggy_*) and then
+**filtered by `AUG_SOURCE`**:
+
+- `"none"`  → real IDs only,
+- `"buggy"` → real + buggy_* (= dive-10),
+- `"llm"`   → real + dive-9 LLM synthetic_* (from the fold and/or `Train_Labels_llm.csv`;
+  aborts with a clear message if no LLM contracts resolve).
+
+Then two gate blocks run **before** any training:
+1. **Leakage** — train∩test = train∩val = val∩test = 0, and val/test carry no synthetic IDs.
+2. **Identical-test** — the test fold equals the recorded dataset-generation 4,466-row
+   benchmark (row count + per-class support); a mismatch is a loud warning, since arms
+   are only comparable on whatever single test set this session loads.
+
+**No re-splitting** — folds come straight from the dataset.
 """)
 
-code("""def _load_fold(name):
-    d = pd.read_csv(SPLIT_DIR / f"{name}.csv")
+code("""def _load_fold_raw(name):
+    d = pd.read_csv(_fold_csv(name))
     have = d["contractID"].apply(lambda c: sol_path(c).exists())
     cov = have.mean()
-    log(f"  {name:>5s}: {len(d):6d} rows | source coverage {cov:.2%}")
+    log(f"  {name:>5s} (raw): {len(d):6d} rows | source coverage {cov:.2%}")
     if cov < 1.0:
         log(f"    dropping {int((~have).sum())} rows with no .sol")
     return d[have].reset_index(drop=True)
 
-train_df = _load_fold("train")
-val_df   = _load_fold("val")
-test_df  = _load_fold("test")
+# --- val / test: FIXED across every arm (the real-only benchmark) ------------
+val_df  = _load_fold_raw("val")
+test_df = _load_fold_raw("test")
 
-n_syn_eval = int((pd.concat([val_df, test_df])["contractID"] >= 1_000_000).sum())
-assert n_syn_eval == 0, f"Leakage: {n_syn_eval} synthetic rows in val/test"
+# --- train fold: load full (real + buggy), then filter by AUG_SOURCE ---------
+train_full = _load_fold_raw("train")
+train_full["_kind"] = train_full["contractID"].apply(_aug_kind)
+_kc = train_full["_kind"].value_counts().to_dict()
+log(f"Train fold raw composition: real={_kc.get('real',0)} "
+    f"buggy={_kc.get('buggy',0)} llm={_kc.get('llm',0)}")
 
+real_df = train_full[train_full["_kind"] == "real"].copy()
+
+if AUG_SOURCE == "none":
+    train_df = real_df
+elif AUG_SOURCE == "buggy":
+    train_df = train_full[train_full["_kind"].isin(["real", "buggy"])].copy()
+else:  # "llm"
+    parts = [real_df]
+    parts.append(train_full[train_full["_kind"] == "llm"])
+    for _p in LLM_LABELS_CANDIDATES:
+        if Path(_p).exists():
+            _ex = pd.read_csv(_p)
+            _have = _ex["contractID"].apply(lambda c: sol_path(c).exists())
+            log(f"  llm extra labels: {_p}  ({len(_ex)} rows, src coverage {_have.mean():.2%})")
+            _ex = _ex[_have].copy(); _ex["_kind"] = "llm"
+            parts.append(_ex[["contractID", *LABEL_COLS, "_kind"]])
+            break
+    train_df = pd.concat(parts, ignore_index=True).drop_duplicates("contractID")
+    n_llm = int(train_df["contractID"].apply(lambda c: _aug_kind(c) == "llm").sum())
+    assert n_llm > 0, (
+        "AUG_SOURCE='llm' but no LLM synthetic_* contracts resolved (none in the train "
+        "fold and none via LLM_LABELS_CANDIDATES with a resolvable .sol). Put the dive-9 "
+        "synthetic .sol under one of LLM_SRC_DIRS and their labels in Train_Labels_llm.csv, "
+        "or use AUG_SOURCE in {'none','buggy'}.")
+    log(f"  llm arm: {n_llm} LLM synthetic contracts added")
+
+train_df = train_df.drop(columns=["_kind"], errors="ignore").reset_index(drop=True)
+
+# ===== VERIFICATION GATES (must pass before any training) ====================
+def _ids(d):
+    return set(d["contractID"].astype(str))
+
+tr_ids, v_ids, te_ids = _ids(train_df), _ids(val_df), _ids(test_df)
+tr_real = {c for c in tr_ids if _aug_kind(c) == "real"}
+
+g_tr_te, g_tr_v, g_v_te = tr_ids & te_ids, tr_ids & v_ids, v_ids & te_ids
+log(f"[gate] leakage  train∩test={len(g_tr_te)}  train∩val={len(g_tr_v)}  val∩test={len(g_v_te)}")
+assert not g_tr_te, f"LEAKAGE: {len(g_tr_te)} train IDs in test (e.g. {list(g_tr_te)[:5]})"
+assert not g_tr_v,  f"LEAKAGE: {len(g_tr_v)} train IDs in val"
+assert not g_v_te,  f"LEAKAGE: {len(g_v_te)} val IDs in test"
+n_syn_eval = int(pd.concat([val_df, test_df])["contractID"].apply(_is_synthetic).sum())
+assert n_syn_eval == 0, f"LEAKAGE: {n_syn_eval} synthetic rows in val/test"
+
+EXPECTED_TEST_ROWS = 4466
+EXPECTED_TEST_SUPPORT = {
+    "Reentrancy": 2280, "Access Control": 3345, "Arithmetic": 1909,
+    "Unchecked Return Values": 1182, "DoS": 756, "Bad Randomness": 127,
+    "Front Running": 121, "Time manipulation": 1265}
+_sup = {c: int(test_df[c].sum()) for c in LABEL_COLS}
+log(f"[gate] test rows={len(test_df)} (expect {EXPECTED_TEST_ROWS})")
+log(f"[gate] test support={_sup}")
+if len(test_df) != EXPECTED_TEST_ROWS or _sup != EXPECTED_TEST_SUPPORT:
+    log("[gate] WARNING: this test set does NOT match the recorded dataset-generation "
+        "4,466-row benchmark. Arms remain comparable to EACH OTHER (same test this session) "
+        "but NOT to the recorded dive-9/dive-10 numbers.")
+else:
+    log("[gate] OK: test set == recorded 4,466-row real benchmark.")
+
+# ----------------------------------------------------------------------------
 df = pd.concat([train_df, val_df, test_df], ignore_index=True)
-log(f"Working set: {df.shape} | train synthetic={int((train_df['contractID']>=1_000_000).sum())}")
+log(f"ARM={AUG_SOURCE} | working set {df.shape} | "
+    f"train={len(train_df)} (real={len(tr_real)}, aug={len(train_df)-len(tr_real)}) "
+    f"val={len(val_df)} test={len(test_df)}")
 log("Positives per class (train fold):")
 for c in LABEL_COLS:
     log(f"  {c:>26s}  {int(train_df[c].sum()):>5d}")
@@ -1077,6 +1279,26 @@ def predict(model, loader):
         logits_all.append(main_logits.float().cpu().numpy())
         labels_all.append(Yb.numpy())
     return np.concatenate(logits_all), np.concatenate(labels_all)
+
+
+@torch.no_grad()
+def predict_with_loss(model, loader):
+    model.eval()
+    logits_all, labels_all = [], []
+    total_loss, n_batches = 0.0, 0
+    for E, M, T, Yb in loader:
+        E      = E.to(device, non_blocking=True)
+        M      = M.to(device, non_blocking=True)
+        T      = T.to(device, non_blocking=True)
+        Yb_dev = Yb.to(device, non_blocking=True)
+        with autocast():
+            main_logits, aux_logits = model(E, M, T)
+            loss = criterion(main_logits, aux_logits, Yb_dev)
+        total_loss += loss.item(); n_batches += 1
+        logits_all.append(main_logits.float().cpu().numpy())
+        labels_all.append(Yb.numpy())
+    mean_loss = total_loss / max(1, n_batches)
+    return np.concatenate(logits_all), np.concatenate(labels_all), mean_loss
 """)
 
 # ---------------------------------------------------------------------------
@@ -1267,28 +1489,29 @@ try:
         epoch_save_done = False
         train_loss, train_dt = _run_epoch(epoch)
 
-        val_logits, val_labels = predict(ema.ema, val_loader)
+        val_logits, val_labels, val_loss = predict_with_loss(ema.ema, val_loader)
         val_probs_raw = 1 / (1 + np.exp(-val_logits))
         calibrators = fit_isotonic_per_class(val_labels, val_probs_raw)
         val_probs   = apply_calibration(val_probs_raw, calibrators)
         val_thr     = tune_thresholds(val_labels, val_probs)
-        val_metrics, _ = multilabel_metrics(val_labels, val_probs, val_thr)
+        val_metrics, val_per_class_metrics = multilabel_metrics(val_labels, val_probs, val_thr)
         val_metrics_raw_05, _ = multilabel_metrics(val_labels, val_probs_raw, 0.5)
 
         # train metrics (non-augmented, raw@0.5) — apples-to-apples vs val raw@0.5 for the overfit watch
-        tr_logits, tr_labels = predict(ema.ema, train_eval_loader)
+        tr_logits, tr_labels, train_loss_eval = predict_with_loss(ema.ema, train_eval_loader)
         train_metrics_raw_05, _ = multilabel_metrics(tr_labels, 1 / (1 + np.exp(-tr_logits)), 0.5)
         overfit_gap = train_metrics_raw_05["f1_macro"] - val_metrics_raw_05["f1_macro"]
         cur_lr = optimizer.param_groups[0]["lr"]
 
-        log(f"Epoch {epoch:2d}/{EPOCHS} | train_dt={train_dt:5.1f}s | lr={cur_lr:.2e} | "
-            f"train_loss={train_loss:.4f} | f1_macro raw@0.5 "
-            f"train={train_metrics_raw_05['f1_macro']:.4f} val={val_metrics_raw_05['f1_macro']:.4f} "
-            f"(gap={overfit_gap:+.4f}) | EMA val calib+thr f1_macro={val_metrics['f1_macro']:.4f} "
-            f"f1_micro={val_metrics['f1_micro']:.4f} ham={val_metrics['hamming_loss']:.4f}")
+        log(f"Epoch {epoch:2d}/{EPOCHS} | elapsed={train_dt:5.1f}s | lr={cur_lr:.2e}")
+        log(f"  loss:  train={train_loss:.4f}  val={val_loss:.4f}")
+        log(f"  F1:    train(raw)={train_metrics_raw_05['f1_macro']:.4f}  "
+            f"val(raw)={val_metrics_raw_05['f1_macro']:.4f}  gap={overfit_gap:+.4f} | "
+            f"val(calib+thr)={val_metrics['f1_macro']:.4f}  micro={val_metrics['f1_micro']:.4f}")
 
         history.append({
-            "epoch": epoch, "train_loss": train_loss, "lr": cur_lr,
+            "epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
+            "train_loss_eval": train_loss_eval, "lr": cur_lr,
             "train_dt": train_dt, **val_metrics,
             "val_f1_macro_raw_05": val_metrics_raw_05["f1_macro"],
             "train_f1_macro_raw_05": train_metrics_raw_05["f1_macro"],
@@ -1313,6 +1536,9 @@ try:
                           "epoch": epoch,
                           "val_metrics": val_metrics}, BEST_PATH)
             log(f"  * NEW BEST EMA macro-F1={best_macro_f1:.4f} -> {BEST_PATH.name}")
+            log("    per-class val F1 (calib+thr):")
+            for _lab in LABEL_COLS:
+                log(f"      {_lab:>26s}  f1={val_per_class_metrics[_lab]['f1']:.4f}")
             patience_left = PATIENCE
         else:
             patience_left -= 1
@@ -1382,7 +1608,8 @@ else:
 if n_gpus > 1 and not isinstance(eval_model, nn.DataParallel):
     eval_model = nn.DataParallel(eval_model)
 
-test_logits, test_labels_arr = predict(eval_model, test_loader)
+test_logits, test_labels_arr, test_loss = predict_with_loss(eval_model, test_loader)
+log(f"test_loss (best model): {test_loss:.4f}")
 test_probs_raw = 1 / (1 + np.exp(-test_logits))
 test_probs     = apply_calibration(test_probs_raw, frozen_calibrators)
 
@@ -1411,8 +1638,12 @@ np.save(OUT_DIR / "test_labels.npy",           test_labels_arr)
 np.save(OUT_DIR / "thresholds.npy",            frozen_thresholds)
 pc_df.to_csv(OUT_DIR / "per_class.csv")
 
-with open(OUT_DIR / "metrics.json", "w") as f:
-    json.dump({
+_metrics_payload = {
+        "aug_source":             AUG_SOURCE,
+        "n_train":                int(len(train_df)),
+        "n_train_real":           int(len(tr_real)),
+        "n_train_aug":            int(len(train_df) - len(tr_real)),
+        "test_loss":              float(test_loss),
         "test_calibrated_tuned":  test_metrics_tuned,
         "test_calibrated_at_0.5": test_metrics_calib_05,
         "test_raw_at_0.5":        test_metrics_raw_05,
@@ -1435,7 +1666,11 @@ with open(OUT_DIR / "metrics.json", "w") as f:
             "per_class_w_min": PER_CLASS_W_MIN, "per_class_w_max": PER_CLASS_W_MAX,
             "class_weights": class_weights.tolist(),
             "patience": PATIENCE, "seed": SEED,
-        }}, f, indent=2)
+        }}
+for _p in (OUT_DIR / "metrics.json", METRICS_ARM_JSON):
+    with open(_p, "w") as f:
+        json.dump(_metrics_payload, f, indent=2)
+log(f"Wrote metrics -> metrics.json and {METRICS_ARM_JSON.name}")
 
 cms = {}
 y_pred_final = (test_probs >= frozen_thresholds[None, :]).astype(np.int32)
@@ -1447,39 +1682,53 @@ with open(OUT_DIR / "confusion_per_class.json", "w") as f:
 """)
 
 # ---------------------------------------------------------------------------
-md("""## 20b — Metrics graphics: train / val / test ( overfit check )
+md("""## 20b — Metrics graphics: loss curves, F1 curves, per-class F1, overfit gap
 
-Two figures, saved to `/kaggle/working/` and shown inline:
-1. **Training curves** — `train_loss` plus train vs val macro-F1 (raw@0.5,
-   apples-to-apples) and the deployed val macro-F1 (calibrated + tuned).
-   Train F1 climbing while val F1 flattens/drops = overfitting.
-2. **Per-class F1 bars across train / val / test** at the best model
-   (calibrated + frozen thresholds). A large train >> val/test gap = overfitting.
+Four figures saved to `/kaggle/working/` and shown inline:
+1. **Loss curves** — `train_loss` + `val_loss` per epoch, `test_loss` as horizontal reference.
+2. **Macro-F1 curves** — train/val F1 (raw@0.5) + val F1 (calib+thr) per epoch, test F1 as reference.
+3. **Per-class F1 bars** — train/val/test at the best model (calibrated + frozen thresholds), with value labels.
+4. **Per-class overfit gap** — (train_f1 − test_f1) per class; green <0.05, orange 0.05–0.10, red >0.10.
 """)
 
 code("""try:
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
 
     hist = pd.DataFrame(history)
 
-    # (1) training curves: loss + train/val macro-F1 (raw@0.5, apples-to-apples)
-    fig, ax1 = plt.subplots(figsize=(9, 5))
-    ax1.plot(hist["epoch"], hist["train_loss"], color="tab:gray", label="train_loss")
-    ax1.set_xlabel("epoch"); ax1.set_ylabel("train loss", color="tab:gray")
-    ax2 = ax1.twinx()
-    if "train_f1_macro_raw_05" in hist:
-        ax2.plot(hist["epoch"], hist["train_f1_macro_raw_05"], color="tab:blue", label="train F1 (raw@0.5)")
-    ax2.plot(hist["epoch"], hist["val_f1_macro_raw_05"], color="tab:orange", label="val F1 (raw@0.5)")
-    ax2.plot(hist["epoch"], hist["f1_macro"], color="tab:green", linestyle="--", label="val F1 (calib+thr)")
-    ax2.set_ylabel("macro-F1"); ax2.set_ylim(0, 1)
-    lines = ax1.get_lines() + ax2.get_lines()
-    ax2.legend(lines, [ln.get_label() for ln in lines], loc="lower right", fontsize=8)
-    plt.title("dive-synthesized-7 — training curves (overfit watch)")
-    fig.tight_layout(); fig.savefig(OUT_DIR / "curves_overfit.png", dpi=120); plt.show(); plt.close(fig)
+    # ── Graph 1: Loss curves ──────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(hist["epoch"], hist["train_loss"], color="tab:blue",   label="train_loss (augmented)")
+    if "val_loss" in hist.columns:
+        ax.plot(hist["epoch"], hist["val_loss"], color="tab:orange", label="val_loss")
+    ax.axhline(test_loss, color="tab:red", linestyle="--", linewidth=1.5,
+               label=f"test_loss={test_loss:.4f}")
+    ax.set_xlabel("epoch"); ax.set_ylabel("loss")
+    ax.set_title(f"dive-synthesized-11 [{AUG_SOURCE}] —loss curves")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3); fig.tight_layout()
+    fig.savefig(OUT_DIR / "loss_curves.png", dpi=120); plt.show(); plt.close(fig)
 
-    # (2) per-class F1 across train / val / test at the best model (calibrated + frozen thresholds)
+    # ── Graph 2: Macro-F1 curves ──────────────────────────────────────────────
+    test_f1_macro = test_metrics_tuned["f1_macro"]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    if "train_f1_macro_raw_05" in hist.columns:
+        ax.plot(hist["epoch"], hist["train_f1_macro_raw_05"], color="tab:blue",
+                label="train F1 (raw@0.5)")
+    ax.plot(hist["epoch"], hist["val_f1_macro_raw_05"], color="tab:orange",
+            label="val F1 (raw@0.5)")
+    ax.plot(hist["epoch"], hist["f1_macro"], color="tab:green", linestyle="--",
+            label="val F1 (calib+thr)")
+    ax.axhline(test_f1_macro, color="tab:red", linestyle="--", linewidth=1.5,
+               label=f"test F1 (calib+thr)={test_f1_macro:.4f}")
+    ax.set_xlabel("epoch"); ax.set_ylabel("macro-F1"); ax.set_ylim(0, 1)
+    ax.set_title(f"dive-synthesized-11 [{AUG_SOURCE}] —macro-F1 curves")
+    ax.legend(fontsize=9); ax.grid(alpha=0.3); fig.tight_layout()
+    fig.savefig(OUT_DIR / "f1_macro_curves.png", dpi=120); plt.show(); plt.close(fig)
+
+    # ── Graph 3: Per-class F1 bars (train / val / test) ───────────────────────
     def _fold_f1(loader):
-        lg, lb = predict(eval_model, loader)
+        lg, lb, _ = predict_with_loss(eval_model, loader)
         pr = apply_calibration(1 / (1 + np.exp(-lg)), frozen_calibrators)
         _, pc = multilabel_metrics(lb, pr, frozen_thresholds)
         return [pc[c]["f1"] for c in LABEL_COLS]
@@ -1490,20 +1739,56 @@ code("""try:
 
     x = np.arange(N_LABELS); bw = 0.27
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.bar(x - bw, f1_train, bw, label=f"train (macro {np.mean(f1_train):.3f})")
-    ax.bar(x,      f1_val,   bw, label=f"val (macro {np.mean(f1_val):.3f})")
-    ax.bar(x + bw, f1_test,  bw, label=f"test (macro {np.mean(f1_test):.3f})")
+    bars_tr = ax.bar(x - bw, f1_train, bw, label=f"train (macro {np.mean(f1_train):.3f})")
+    bars_v  = ax.bar(x,      f1_val,   bw, label=f"val   (macro {np.mean(f1_val):.3f})")
+    bars_te = ax.bar(x + bw, f1_test,  bw, label=f"test  (macro {np.mean(f1_test):.3f})")
+    for bars in (bars_tr, bars_v, bars_te):
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0.01:
+                ax.text(bar.get_x() + bar.get_width() / 2, h + 0.01, f"{h:.2f}",
+                        ha="center", va="bottom", fontsize=6, rotation=45)
     ax.set_xticks(x); ax.set_xticklabels(LABEL_COLS, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("F1 (calibrated + frozen thresholds)"); ax.set_ylim(0, 1)
-    ax.set_title("dive-synthesized-7 — per-class F1: train vs val vs test")
-    ax.legend(); fig.tight_layout()
+    ax.set_ylabel("F1 (calibrated + frozen thresholds)"); ax.set_ylim(0, 1.12)
+    ax.set_title(f"dive-synthesized-11 [{AUG_SOURCE}] —per-class F1: train vs val vs test")
+    ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3); fig.tight_layout()
     fig.savefig(OUT_DIR / "per_class_f1_train_val_test.png", dpi=120); plt.show(); plt.close(fig)
 
-    pd.DataFrame({"class": LABEL_COLS, "f1_train": f1_train, "f1_val": f1_val, "f1_test": f1_test}).to_csv(OUT_DIR / "f1_train_val_test.csv", index=False)
-    log("Saved graphics: curves_overfit.png, per_class_f1_train_val_test.png, f1_train_val_test.csv")
-    log(f"macro-F1 (calib+thr)  train={np.mean(f1_train):.4f}  val={np.mean(f1_val):.4f}  test={np.mean(f1_test):.4f}  (train-test gap={np.mean(f1_train)-np.mean(f1_test):+.4f})")
+    # ── Graph 4: Per-class overfit gap (train_f1 - test_f1) ──────────────────
+    gaps = [tr - te for tr, te in zip(f1_train, f1_test)]
+    colors = ["tab:red" if g >= 0.10 else ("tab:orange" if g >= 0.05 else "tab:green") for g in gaps]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    bars_gap = ax.bar(np.arange(N_LABELS), gaps, color=colors)
+    for bar, g in zip(bars_gap, gaps):
+        ax.text(bar.get_x() + bar.get_width() / 2, max(g, 0) + 0.005,
+                f"{g:+.3f}", ha="center", va="bottom", fontsize=8)
+    ax.axhline(0,    color="black",      linewidth=0.8)
+    ax.axhline(0.05, color="tab:orange", linestyle=":", linewidth=1)
+    ax.axhline(0.10, color="tab:red",    linestyle=":", linewidth=1)
+    ax.set_xticks(np.arange(N_LABELS))
+    ax.set_xticklabels(LABEL_COLS, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("train_f1 − test_f1")
+    ax.set_title(f"dive-synthesized-11 [{AUG_SOURCE}] —per-class overfit gap (train − test)")
+    ax.legend(handles=[
+        mpatches.Patch(color="tab:green",  label="OK  (<0.05)"),
+        mpatches.Patch(color="tab:orange", label="borderline (0.05–0.10)"),
+        mpatches.Patch(color="tab:red",    label="OVERFIT (>0.10)"),
+    ], fontsize=8); fig.tight_layout()
+    fig.savefig(OUT_DIR / "per_class_overfit_gap.png", dpi=120); plt.show(); plt.close(fig)
+
+    # ── Text summary ─────────────────────────────────────────────────────────
+    pd.DataFrame({"class": LABEL_COLS, "f1_train": f1_train, "f1_val": f1_val,
+                  "f1_test": f1_test, "gap_train_test": gaps}).to_csv(
+        OUT_DIR / "f1_train_val_test.csv", index=False)
+    log("Saved: loss_curves.png, f1_macro_curves.png, per_class_f1_train_val_test.png, per_class_overfit_gap.png")
+    log(f"macro-F1 (calib+thr)  train={np.mean(f1_train):.4f}  val={np.mean(f1_val):.4f}  "
+        f"test={np.mean(f1_test):.4f}  (train-test gap={np.mean(f1_train)-np.mean(f1_test):+.4f})")
+    log("=== PER-CLASS OVERFIT GAP (train_f1 − test_f1, sorted descending) ===")
+    for lab, g in sorted(zip(LABEL_COLS, gaps), key=lambda x: x[1], reverse=True):
+        flag = "OVERFIT" if g >= 0.10 else ("borderline" if g >= 0.05 else "OK")
+        log(f"  {lab:>26s}  gap={g:+.4f}  [{flag}]")
 except Exception as e:
-    log(f"Metrics plotting skipped due to error: {e!r}")
+    log(f"Metrics plotting skipped: {e!r}")
 """)
 
 # ---------------------------------------------------------------------------
@@ -1556,7 +1841,7 @@ rng = np.random.RandomState(0)
 demo_rows = rng.choice(idx_te, size=8, replace=False)
 log("=== INFERENCE DEMO (predicted vs true) ===")
 for row in demo_rows:
-    cid = int(df.iloc[row]["contractID"])
+    cid = df.iloc[row]["contractID"]
     cal, pred = infer_contract(read_source(cid))
     true = Y[row].astype(int)
     pl = [LABEL_COLS[i] for i in range(N_LABELS) if pred[i]]
@@ -1569,7 +1854,7 @@ for row in demo_rows:
 
 BENCH_N = 256
 bench_rows = rng.choice(idx_te, size=min(BENCH_N, len(idx_te)), replace=False)
-bench_src = [read_source(int(df.iloc[r]["contractID"])) for r in bench_rows]
+bench_src = [read_source(df.iloc[r]["contractID"]) for r in bench_rows]
 
 for s in bench_src[:8]:        # warmup
     infer_contract(s)
@@ -1602,6 +1887,54 @@ log("Wrote inference_bench.json")
 """)
 
 # ---------------------------------------------------------------------------
+md("""## 22 — Arm comparison table ( aggregates every `metrics_arm_*.json` )
+
+Reads all per-arm metric files written so far this session and tabulates macro-F1 +
+per-class F1, **all on the same fixed real test set**. To fill the table, run this
+notebook once per arm in the same Kaggle session: set `AUG_SOURCE` to `"none"`, run
+all cells; change it to `"buggy"`, run all cells; then `"llm"`, run all cells. Each
+run appends its `metrics_arm_<arm>.json` to `/kaggle/working`, so this cell shows
+whatever arms have completed.
+""")
+
+code('''import json as _json
+
+rows = []
+for _f in sorted(OUT_DIR.glob("metrics_arm_*.json")):
+    m = _json.load(open(_f))
+    arm = m.get("aug_source", _f.stem.replace("metrics_arm_", ""))
+    rec = {"arm": arm,
+           "n_train": m.get("n_train"), "n_aug": m.get("n_train_aug"),
+           "macro_f1": round(m["test_calibrated_tuned"]["f1_macro"], 4),
+           "micro_f1": round(m["test_calibrated_tuned"]["f1_micro"], 4)}
+    for c in LABEL_COLS:
+        rec[c] = round(m["per_class"][c]["f1"], 4)
+    rows.append(rec)
+
+if rows:
+    _order = {"none": 0, "buggy": 1, "llm": 2}
+    rows.sort(key=lambda r: _order.get(r["arm"], 9))
+    cmp_df = pd.DataFrame(rows)
+    cmp_df.to_csv(OUT_DIR / "comparison.csv", index=False)
+    with open(OUT_DIR / "comparison.json", "w") as f:
+        _json.dump(rows, f, indent=2)
+    log("=== ARM COMPARISON (all arms on the SAME fixed real test set) ===")
+    for line in cmp_df.to_string(index=False).splitlines():
+        log("  " + line)
+    if any(r["arm"] == "none" for r in rows):
+        base = next(r for r in rows if r["arm"] == "none")["macro_f1"]
+        for r in rows:
+            if r["arm"] != "none":
+                log(f"  delta macro-F1 ({r['arm']} - none) = {r['macro_f1'] - base:+.4f}")
+    log("NOTE: dive-9's 0.7854 and dive-10's 0.7634 were measured on DIFFERENT test sets "
+        "and are NOT directly comparable to these numbers. Only the 'buggy' arm (same data "
+        "+ same test as dive-10) should reproduce ~0.7634 — that is the harness sanity check.")
+else:
+    log(f"Only the current arm ({AUG_SOURCE}) is present so far. Re-run with the other "
+        f"AUG_SOURCE values in the same session to populate the comparison table.")
+''')
+
+# ---------------------------------------------------------------------------
 md("""## Summary
 
 **dive-6 = modality switch + transfer learning.** Source instead of bytecode;
@@ -1611,26 +1944,26 @@ a frozen pretrained code model instead of a from-scratch encoder.
 1. Split each `.sol` into function/header units ( brace-matching, robust across
    0.4-0.8 ), risk-ranked cap to `MAX_UNITS=32`.
 2. Frozen GraphCodeBERT mean-pools each unit ( <=256 tokens ) into a 768-d
-   vector — cached once to `dive_synth7_units.npz`.
+   vector — cached once to `dive_synth11_units.npz`.
 3. A small set-Transformer aggregates the unit set ( permutation-invariant, +
    unit-type embedding ) and feeds dive-5's exact head ( 8 per-class MLPs + aux
    BCE on BR/FR ), trained with the same loss / sampler / EMA / calibration /
    threshold-tuning / checkpointing.
 
 **Outputs (`/kaggle/working/`).**
-- `cache/dive_synth7_units.npz` — frozen unit embeddings ( reused on resume ).
+- `cache/dive_synth11_units.npz` — frozen unit embeddings ( reused on resume ).
 - `best_model.pt` — EMA weights + calibrators + frozen thresholds.
 - `last_state.pt` — full resumable state ( `RESUME_FROM` ).
-- `metrics.json`, `per_class.csv`, `history.csv`, `dive_synth7_train.log`.
+- `metrics.json`, `per_class.csv`, `history.csv`, `dive_synth11_train.log`.
+- `loss_curves.png`, `f1_macro_curves.png`, `per_class_f1_train_val_test.png`, `per_class_overfit_gap.png`.
 
 **What to look at.**
-1. Gate logs: source coverage, units/contract, tokens/unit truncation, stage-1
-   timing estimate.
-2. `test_calibrated_tuned.f1_macro` vs dive-5's 0.7471.
-3. Per-class F1 on Front Running / Bad Randomness / DoS — the transfer-learning
-   targets.
+1. Gate logs: source coverage, units/contract, tokens/unit truncation, stage-1 timing.
+2. `test_calibrated_tuned.f1_macro` vs dive-9's 0.7854 — the data-diversity delta.
+3. Per-class F1 on Bad Randomness / Front Running — the targeted classes.
+4. Graph 4 (per-class overfit gap) — green = OK, orange = borderline, red = OVERFIT.
 
-**If you later want more accuracy** ( dive-7 ): unfreeze the top GraphCodeBERT
+**If you later want more accuracy** ( dive-11 ): unfreeze the top GraphCodeBERT
 layers for end-to-end fine-tuning ( hard-cap units, gradient checkpointing ), or
 fuse this source model with the dive-5 bytecode model + transaction features.
 """)
@@ -1650,6 +1983,6 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-out = Path(__file__).parent / "dive-synthesized-7.ipynb"
+out = Path(__file__).parent / "dive-synthesized-11.ipynb"
 out.write_text(json.dumps(notebook, indent=1), encoding="utf-8")
 print(f"Wrote {out} ({out.stat().st_size/1024:.1f} KB, {len(cells)} cells)")
