@@ -163,24 +163,32 @@ Edit **only** this cell to switch between fresh run and resume.
 
 code("""# -- Paths --------------------------------------------------------------------
 def _find_root(base):
-    \"\"\"Find dataset root by locating a splits or final directory with a CSV.\"\"\"
+    \"\"\"Find dataset root: look for any directory named 'splits' or 'final' that
+    contains at least one CSV — works regardless of exact file naming.\"\"\"
     base = Path(base)
     if not base.exists():
         return None
-    # Support both rm-sc-test layout (splits/train.csv) and
-    # dataset-generation layout (splits/Train_Labels.csv, final/Train_Labels.csv)
-    for pattern in ("train.csv", "Train_Labels.csv"):
-        hits = [h for h in base.rglob(pattern) if h.parent.name in ("splits", "final")]
-        if hits:
-            return hits[0].parent.parent
+    for d in sorted(base.rglob("*")):      # sorted = deterministic
+        if d.is_dir() and d.name in ("splits", "final"):
+            if any(d.glob("*.csv")):
+                return d.parent
     return None
 
-DATA_ROOT = (_find_root("/kaggle/input/datasets/henrychristian7555/dive-synthesized")
-             or _find_root("/kaggle/input/dive-synthesized"))
+_DS_BASE = Path("/kaggle/input/datasets/henrychristian7555/dive-synthesized")
+DATA_ROOT = _find_root(_DS_BASE) or _find_root(Path("/kaggle/input/dive-synthesized"))
 if DATA_ROOT is None:
+    # Diagnostic: show top-level layout before failing
+    if _DS_BASE.exists():
+        print("Dataset base found. Contents:", flush=True)
+        for _p in sorted(_DS_BASE.rglob("*")):
+            if _p.is_dir() or _p.suffix == ".csv":
+                print(f"  {_p.relative_to(_DS_BASE)}", flush=True)
     import kagglehub
     DATA_ROOT = _find_root(kagglehub.dataset_download("henrychristian7555/dive-synthesized"))
-assert DATA_ROOT is not None, "dive-synthesized dataset not found"
+assert DATA_ROOT is not None, (
+    f"dive-synthesized dataset not found — could not locate a 'splits/' or 'final/' "
+    f"directory containing CSV files under {_DS_BASE}"
+)
 
 SPLIT_DIR  = DATA_ROOT / "splits"
 _FINAL_DIR = DATA_ROOT / "final"
