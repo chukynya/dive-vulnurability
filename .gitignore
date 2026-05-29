@@ -1,2 +1,7 @@
 Dataset
 archives/
+Data-before-aug/
+Data-before-aug.zip
+work/
+tools/__pycache__/
+.claude/settings.local.json
