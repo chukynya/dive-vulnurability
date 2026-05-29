@@ -83,35 +83,44 @@ replace_in(4, "dive_synth11_units.npz", "dive_dedup1_units.npz")
 set_src(5, '''# -- Paths --------------------------------------------------------------------
 # Bytecode-deduplicated dataset, pre-built 70/10/20 splits. Single Source/ dir
 # (no synthetic, no augmentation), so resolution is a flat contractID -> .sol map.
-def _find_root(base):
-    """Find dataset root: the dir that contains a 'splits' subdir with CSVs."""
-    base = Path(base)
-    if not base.exists():
-        return None
-    if (base / "splits").is_dir() and any((base / "splits").glob("*.csv")):
-        return base
-    for d in sorted(base.rglob("*")):          # sorted = deterministic
-        if d.is_dir() and d.name == "splits" and any(d.glob("*.csv")):
-            return d.parent
+def _root_ok(d):
+    """True if d is a dataset root: has splits/Train_Labels.csv and a Source/ dir."""
+    d = Path(d)
+    return ((d / "splits" / "Train_Labels.csv").exists() and (d / "Source").is_dir())
+
+def _find_root():
+    # 1) explicit candidates (the paths documented on the Kaggle dataset)
+    for c in ("/kaggle/input/datasets/henrychristian7555/dive-dedup/Data-before-aug",
+              "/kaggle/input/dive-dedup/Data-before-aug",
+              "/kaggle/input/datasets/henrychristian7555/dive-dedup",
+              "/kaggle/input/dive-dedup"):
+        if _root_ok(c):
+            return Path(c)
+    # 2) scan everything mounted under /kaggle/input (handles any mount slug/nesting)
+    base = Path("/kaggle/input")
+    if base.exists():
+        for sp in sorted(base.rglob("splits")):        # deterministic
+            if _root_ok(sp.parent):
+                return sp.parent
+    # 3) local fallback (running outside Kaggle)
+    if _root_ok("Data-before-aug"):
+        return Path("Data-before-aug")
     return None
 
-_DS_BASE = Path("/kaggle/input/datasets/henrychristian7555/dive-dedup/Data-before-aug")
-DATA_ROOT = (_find_root(_DS_BASE)
-             or _find_root("/kaggle/input/dive-dedup/Data-before-aug")
-             or _find_root("/kaggle/input/datasets/henrychristian7555/dive-dedup")
-             or _find_root("/kaggle/input/dive-dedup"))
+DATA_ROOT = _find_root()
 if DATA_ROOT is None:
-    if _DS_BASE.exists():
-        print("Dataset base found. Contents:", flush=True)
-        for _p in sorted(_DS_BASE.rglob("*")):
+    print("Could not locate the dataset. Contents of /kaggle/input:", flush=True)
+    _base = Path("/kaggle/input")
+    if _base.exists():
+        for _p in sorted(_base.rglob("*")):
             if _p.is_dir() or _p.suffix == ".csv":
-                print(f"  {_p.relative_to(_DS_BASE)}", flush=True)
-    import kagglehub
-    DATA_ROOT = _find_root(Path(kagglehub.dataset_download("henrychristian7555/dive-dedup")) / "Data-before-aug") \\
-        or _find_root(kagglehub.dataset_download("henrychristian7555/dive-dedup"))
+                print("  ", _p, flush=True)
+    else:
+        print("  /kaggle/input does not exist", flush=True)
 assert DATA_ROOT is not None, (
-    f"dive-dedup dataset not found — could not locate a 'splits/' directory "
-    f"containing CSV files under {_DS_BASE}")
+    "dive-dedup dataset not attached. In the Kaggle editor: Add Input -> search "
+    "'dive-dedup' (henrychristian7555/dive-dedup), attach it, then re-run. Expected "
+    "layout: <mount>/Data-before-aug/{splits/Train_Labels.csv, Source/}.")
 
 SPLIT_DIR = DATA_ROOT / "splits"
 SOURCE_DIR = DATA_ROOT / "Source"
