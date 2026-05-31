@@ -2,6 +2,8 @@ Dataset
 archives/
 Data-before-aug/
 Data-before-aug.zip
+dive-dedup/
+dive-synthesized-dedup/
 work/
 tools/__pycache__/
 .claude/settings.local.json
